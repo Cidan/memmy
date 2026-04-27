@@ -1,0 +1,63 @@
+server:
+  transports:
+    mcp:
+      enabled: true
+      addr: "0.0.0.0:8765"
+
+storage:
+  backend: bbolt
+  bbolt:
+    path: "./data/memmy.db"
+
+embedder:
+  # Set backend to "gemini" for production.
+  # The fake backend is intended for development and integration tests.
+  backend: fake
+  fake:
+    dim: 64
+  gemini:
+    model: "text-embedding-004"
+    api_key_env: "GEMINI_API_KEY"
+    dim: 768
+    concurrency: 8
+
+vector_index:
+  flat_scan_threshold: 5000
+  hnsw:
+    m: 16
+    m0: 32
+    ef_construction: 200
+    ef_search: 100
+    ml: 0.36
+
+memory:
+  chunk_window_size: 3
+  chunk_stride: 2
+  retrieval_k: 8
+  retrieval_hops: 2
+  retrieval_oversample: 300
+  structural_recent_n: 16
+  structural_recent_delta: 5m
+
+  scoring:
+    sim_alpha: 1.0
+    weight_beta: 0.5
+
+  decay:
+    node_lambda: 8.0e-8
+    edge_structural_lambda: 4.0e-8
+    edge_coretrieval_lambda: 2.7e-7
+    edge_cotraversal_lambda: 1.3e-7
+
+  reinforce:
+    node_delta: 1.0
+    edge_coretrieval_base: 0.5
+    edge_cotraversal_multiplier: 1.5
+    edge_structural_weight: 1.0
+    edge_structural_temporal_weight: 0.3
+
+  prune:
+    edge_floor: 0.05
+    node_floor: 0.01
+
+  weight_cap: 100.0

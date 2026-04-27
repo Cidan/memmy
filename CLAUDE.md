@@ -1,7 +1,9 @@
 # memmy — Project Conventions for Claude
 
 memmy is an LLM memory system written in pure Go (toolchain: **Go 1.26.2**), exposed over MCP and (future) gRPC + HTTP.
-**`DESIGN.md` is the source of truth for architecture and design rationale.** Read it first; the design principles in §0 are load-bearing. This file captures conventions and preferences for working in this repo.
+**`DESIGN.md` is the source of truth for architecture and design rationale.** Read it first; the design principles in §0 are load-bearing.
+**`IMPLEMENTATION.md` is the running checklist** for what's built and what's left. Update it as work lands.
+This file captures conventions and preferences for working in this repo.
 
 ## Stack
 
