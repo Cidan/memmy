@@ -6,8 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"go.etcd.io/bbolt"
-
 	"github.com/Cidan/memmy/internal/chunker"
 	"github.com/Cidan/memmy/internal/types"
 )
@@ -156,7 +154,3 @@ func (s *Service) recentNodeIDsInTenant(ctx context.Context, tenant string, sinc
 type recentNodeScanner interface {
 	RecentNodeIDs(ctx context.Context, tenant string, since time.Time, excludeMsgID string, maxN int) ([]string, error)
 }
-
-// silence unused import in case bbolt isn't referenced in this file's
-// final form; the import is required by some platforms' build tooling.
-var _ = bbolt.DefaultOptions

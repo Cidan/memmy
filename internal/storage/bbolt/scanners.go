@@ -1,8 +1,8 @@
 package bboltstore
 
 import (
+	"bytes"
 	"context"
-	"crypto/rand"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -38,7 +38,7 @@ func (g graphAdapter) RecentNodeIDs(_ context.Context, tenant string, since time
 		cur := nb.Cursor()
 		for k, v := cur.Last(); k != nil; k, v = cur.Prev() {
 			// Stop once we've crossed `since` in reverse order.
-			if compareBytes(k, sinceKey) < 0 {
+			if bytes.Compare(k, sinceKey) < 0 {
 				break
 			}
 			var n types.Node
@@ -169,29 +169,3 @@ func (zeroReader) Read(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// compareBytes is bytes.Compare without importing the package (cheap helper).
-func compareBytes(a, b []byte) int {
-	la, lb := len(a), len(b)
-	n := la
-	if lb < n {
-		n = lb
-	}
-	for i := 0; i < n; i++ {
-		if a[i] != b[i] {
-			if a[i] < b[i] {
-				return -1
-			}
-			return 1
-		}
-	}
-	if la == lb {
-		return 0
-	}
-	if la < lb {
-		return -1
-	}
-	return 1
-}
-
-// silence unused crypto/rand when scanners.go is compiled standalone.
-var _ = rand.Reader

@@ -7,8 +7,6 @@ import (
 	"math/rand/v2"
 	"sort"
 	"testing"
-
-	vidx "github.com/Cidan/memmy/internal/vectorindex"
 )
 
 func TestVectorIndex_Flat_TopK(t *testing.T) {
@@ -191,5 +189,3 @@ func dotF(a, b []float32) float64 {
 	return s
 }
 
-// silence unused import when tests are filtered
-var _ = vidx.ErrNotFound
