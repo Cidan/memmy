@@ -166,23 +166,47 @@ type statsResult struct {
 
 func (a *Adapter) registerTools() {
 	registerToolWithTenantSchema(a.srv, a.tenantSchema, &mcpsdk.Tool{
-		Name:        "memory.write",
-		Description: "Ingest a message into memory. Splits into chunks, embeds, persists nodes/vectors/HNSW links and structural memory edges.",
+		Name: "memory.write",
+		Description: "Save something worth remembering across conversations: a fact, " +
+			"decision, preference, recurring pattern, or piece of project context. " +
+			"Write liberally — memmy decays unused memory exponentially and reinforces " +
+			"what gets recalled, so sparse writes starve the signal the system uses to " +
+			"self-tune. There is no separate 'index' to keep clean; the access pattern " +
+			"is the index. Use this whenever the conversation surfaces information that " +
+			"would still be useful tomorrow. Choose tenant by scope: project-specific " +
+			"(code, decisions, repo conventions) → `tenant.project`; cross-project " +
+			"(user preferences, recurring patterns, durable knowledge) → " +
+			"`tenant.scope=\"global\"`.",
 	}, writeArgs{}, a.handleWrite)
 
 	registerToolWithTenantSchema(a.srv, a.tenantSchema, &mcpsdk.Tool{
-		Name:        "memory.recall",
-		Description: "Retrieve memories by semantic similarity with weight-aware re-ranking and graph expansion. Returns ranked results with provenance.",
+		Name: "memory.recall",
+		Description: "Retrieve relevant memories before answering. Call this FIRST any time " +
+			"the question might benefit from prior context — project history, prior " +
+			"decisions, the user's preferences, recurring patterns, anything that " +
+			"could already be stored. Recall is the load-bearing operation: every " +
+			"call reinforces the memories it surfaces (Hebbian co-retrieval) and " +
+			"the edges that delivered them (co-traversal), so calling recall is how " +
+			"the corpus learns what matters. Cheap; favor calling over assuming " +
+			"nothing is stored. Returns ranked hits with score breakdown and " +
+			"provenance (source message text, traversal path, sim/weight/graph " +
+			"components) so you can judge confidence and cite.",
 	}, recallArgs{}, a.handleRecall)
 
 	registerToolWithTenantSchema(a.srv, a.tenantSchema, &mcpsdk.Tool{
-		Name:        "memory.forget",
-		Description: "Hard-delete a message and all derived nodes/vectors/edges, or all messages older than a timestamp.",
+		Name: "memory.forget",
+		Description: "Hard-delete a specific message (by id) or every message older than a " +
+			"timestamp. Use only when memory must be erased outright — corrected " +
+			"misinformation, secrets written by mistake, an explicit user request " +
+			"to forget. Routine cleanup is NOT a use case: stale and unused memory " +
+			"decays and is pruned automatically on read, so reach for this rarely.",
 	}, forgetArgs{}, a.handleForget)
 
 	registerToolWithTenantSchema(a.srv, a.tenantSchema, &mcpsdk.Tool{
-		Name:        "memory.stats",
-		Description: "Return per-tenant or aggregate memory counts and weight statistics.",
+		Name: "memory.stats",
+		Description: "Return counts and average weights for one tenant or in aggregate. " +
+			"Useful for sanity-checking that writes are landing, gauging corpus " +
+			"size before tuning oversample/k, or surfacing per-tenant health.",
 	}, statsArgs{}, a.handleStats)
 }
 
