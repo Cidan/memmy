@@ -93,7 +93,7 @@ Working list of what we're building. Source-of-truth for design lives in `DESIGN
 - [x] YAML loader matching DESIGN.md §12 schema
 - [x] Validation; env-var resolution for API keys
 - [x] Tests for happy path + missing required fields
-- [x] Sample config at `memmy.yaml.example`
+- [x] Sample config at `memmy.example.yaml`
 
 ### US-014 — MCP transport adapter (`internal/transport/mcp/`) ✅
 - [x] Server using `github.com/modelcontextprotocol/go-sdk` v1.5.0

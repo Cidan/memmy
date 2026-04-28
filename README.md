@@ -14,7 +14,7 @@ The load-bearing design principle is **one source of truth: the database**. Vect
 
 ```sh
 go build ./cmd/memmy
-cp memmy.yaml.example memmy.yaml   # then edit
+cp memmy.example.yaml memmy.yaml   # then edit
 ./memmy --config memmy.yaml
 ```
 
