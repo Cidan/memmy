@@ -46,7 +46,7 @@ These are restatements of the load-bearing principles in DESIGN.md §0. Do not d
 - Time: never call `time.Now()` deep in business logic. Plumb a `Clock` interface (`Now() time.Time`) wherever decay math runs.
 - Context: every interface method takes `ctx context.Context` first.
 - IDs: ULIDs for nodes and messages.
-- Layout: `internal/service/` (MemoryService impl), `internal/transport/<name>/` (adapters), `internal/storage/<backend>/` (backend impls), `internal/embed/<provider>/` (embedder impls), `internal/embed/fake/` (test embedder), `internal/graph/`, `internal/vectorindex/`, `internal/types/` (Node, MemoryEdge, etc.).
+- Layout: `internal/service/` (MemoryService impl), `internal/transport/<name>/` (adapters), `internal/storage/<backend>/` (backend impls), `internal/embed/<provider>/` (embedder impls), `internal/embed/fake/` (test embedder), `internal/graph/`, `internal/vectorindex/`, `internal/types/` (Node, MemoryEdge, etc.), `internal/chunker/` (sentence splitter + sliding window), `internal/clock/` (Clock interface + Real/Fake), `internal/config/` (YAML loader).
 
 ## Testing
 

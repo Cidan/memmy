@@ -231,8 +231,11 @@ The data model is described in terms of **collections** keyed by tenant + identi
 | `hnsw_meta`           | `TenantID`                   | `HNSWMeta`                     | VectorIndex |
 | `memory_edges_out`    | `(TenantID, FromID, ToID)`   | `MemoryEdge`                   | Graph       |
 | `memory_edges_in` ¹   | `(TenantID, ToID, FromID)`   | `MemoryEdge` (mirror)          | Graph       |
+| `tenant_counters` ²   | `TenantID`                   | `{NodeCount, EdgeCount, SumNodeWeight, SumEdgeWeight}` | Graph |
 
 ¹ The `_in` mirror is required only for backends that don't support efficient lookups in both directions natively. KV backends (bbolt, badger, pebble, Bigtable) need the mirror because prefix scans only work on a single key prefix. SQL backends with proper secondary indexes can collapse `out` and `in` into one `memory_edges` table. The interface contract is "neighbor lookup is efficient in either direction"; how the backend gets there is its problem.
+
+² `tenant_counters` backs the `Stats` operation in O(1) per tenant. Maintained transactionally by every Graph mutation (`PutNode`, `UpdateNode`, `DeleteNode`, `PutEdge`, `UpdateEdge`, `DeleteEdge`) — upsert paths capture an old-weight delta; brand-new paths increment the count. Backends MAY skip this collection if they can answer Stats without walking buckets via native counts/aggregates (e.g., SQL `COUNT(*)` + `SUM(weight)` with appropriate indexes).
 
 **Operations the backend must support:**
 
@@ -257,7 +260,8 @@ root
 │       │   ├── meta                    → gob(HNSWMeta)
 │       │   └── records/<nodeID>        → gob(HNSWRecord)
 │       ├── eout/     <fromID>/<toID>   → gob(MemoryEdge)       # outbound
-│       └── ein/      <toID>/<fromID>   → gob(MemoryEdge)       # mirror
+│       ├── ein/      <toID>/<fromID>   → gob(MemoryEdge)       # mirror
+│       └── counters/ v                 → gob(tenantCounters)   # O(1) Stats backing
 └── meta/
     └── schema_version → uint32
 ```
