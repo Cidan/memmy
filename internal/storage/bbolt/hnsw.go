@@ -283,7 +283,9 @@ func (s *Storage) linkAndPruneTx(tx *bbolt.Tx, tenant, n, nodeID string, nodeVec
 		if !ok {
 			return fmt.Errorf("hnsw: vector for neighbor %q missing during prune", n)
 		}
-		// Build candidate list from current neighbors.
+		// Build candidate list from current neighbors. Each candidate
+		// carries its vector so the heuristic can compute pairwise
+		// distances during the diversity check.
 		cands := make([]candidate, 0, len(rec.Neighbors[ℓ]))
 		buf := make([]float32, s.dim)
 		for _, id := range rec.Neighbors[ℓ] {
@@ -301,9 +303,8 @@ func (s *Storage) linkAndPruneTx(tx *bbolt.Tx, tenant, n, nodeID string, nodeVec
 				v = make([]float32, s.dim)
 				copy(v, buf)
 			}
-			cands = append(cands, candidate{id: id, dist: 1 - float64(dot(v, nVec))})
+			cands = append(cands, candidate{id: id, dist: 1 - float64(dot(v, nVec)), vec: v})
 		}
-		sort.Slice(cands, func(i, j int) bool { return cands[i].dist < cands[j].dist })
 		chosen := selectNeighborsHeuristic(cands, mTarget)
 		ids := make([]string, len(chosen))
 		for i, c := range chosen {
@@ -436,7 +437,9 @@ func (s *Storage) searchLayerTx(tx *bbolt.Tx, tenant string, q []float32, eps []
 			}
 			d := 1 - float64(dot(q, buf))
 			if resultsPQ.len() < ef || d < resultsPQ.worst().dist {
-				cand := candidate{id: id, dist: d}
+				vec := make([]float32, s.dim)
+				copy(vec, buf)
+				cand := candidate{id: id, dist: d, vec: vec}
 				candidatesPQ.push(cand)
 				resultsPQ.push(cand)
 			}
@@ -570,9 +573,14 @@ func pickEntryPoint(tx *bbolt.Tx, tenant string) (string, int, error) {
 
 // ----- candidate priority queues -----
 
+// candidate is one node-with-distance carried through HNSW search and
+// neighbor selection. The optional vec is populated by callers that
+// need pairwise distance computations (Malkov §4 Algorithm 4 diversity
+// check). Search-only callers may leave vec nil.
 type candidate struct {
 	id   string
 	dist float64
+	vec  []float32
 }
 
 // candMinPQ pops the candidate with the smallest distance.
@@ -686,18 +694,25 @@ func (h *candMaxPQ) siftDownMax(i int) {
 
 // ----- neighbor-selection heuristic (Malkov §4 Alg.4) -----
 
-// selectNeighborsHeuristic picks up to m candidates that are diverse with
-// respect to q. Input must be sorted by distance ascending OR be an
-// arbitrary order — we sort internally. Returns the selected candidates
-// in the order they were chosen (closer-first, with diversity).
+// selectNeighborsHeuristic picks up to m candidates that are diverse
+// with respect to the implicit query point q (whatever the candidates'
+// dist field measures distance to). Implements Algorithm 4 of Malkov
+// & Yashunin (2018) with extendCandidates=false and
+// keepPrunedConnections=true.
 //
-// We rely on the "keep pruned connections" mode to ensure we always get
-// up to m results when possible.
+// Pull candidates closest-to-q first. Admit c iff for every already-
+// chosen r, c is closer to q than to r — i.e., dist(c, q) < dist(c, r).
+// Otherwise hold c in the discarded set. Once the main loop finishes,
+// fill any remaining slots from the discarded set in dist-to-q order so
+// we always return min(|W|, m) candidates.
+//
+// Each candidate must carry vec; callers that lack vectors get the
+// same closest-first behavior as before since the diversity check
+// silently degrades (no veci → no rejection).
 func selectNeighborsHeuristic(W []candidate, m int) []candidate {
 	if m <= 0 || len(W) == 0 {
 		return nil
 	}
-	// Copy so we don't mutate the caller's slice.
 	cands := make([]candidate, len(W))
 	copy(cands, W)
 	sort.Slice(cands, func(i, j int) bool { return cands[i].dist < cands[j].dist })
@@ -707,27 +722,40 @@ func selectNeighborsHeuristic(W []candidate, m int) []candidate {
 	}
 
 	chosen := make([]candidate, 0, m)
-	pruned := make([]candidate, 0)
+	discarded := make([]candidate, 0, len(cands))
 
-	// We need to know vector(c) ↔ vector(r) distances to apply the
-	// heuristic, but we don't have vectors here. The heuristic is
-	// approximated by using cand-to-cand distances inferred via the
-	// triangle inequality on the cosine metric: when both c and r are
-	// roughly equidistant to q, their mutual distance is bounded by
-	// |dist(c,q) - dist(r,q)|.
-	//
-	// Without vector access this is imprecise. To keep correctness, we
-	// fall back to "closest-first" selection (M closest), which is the
-	// safe default and still passes the recall oracle in practice.
 	for _, c := range cands {
-		if len(chosen) < m {
+		if len(chosen) >= m {
+			discarded = append(discarded, c)
+			continue
+		}
+		admit := true
+		if c.vec != nil {
+			for _, r := range chosen {
+				if r.vec == nil {
+					continue
+				}
+				rdist := 1 - float64(dot(c.vec, r.vec))
+				if rdist <= c.dist {
+					admit = false
+					break
+				}
+			}
+		}
+		if admit {
 			chosen = append(chosen, c)
 		} else {
-			pruned = append(pruned, c)
+			discarded = append(discarded, c)
 		}
 	}
-	// keepPrunedConnections: top up if needed (already at m here).
-	_ = pruned
+	// keepPrunedConnections — fill remaining slots with the closest of
+	// the discarded set (already in dist-ascending order).
+	for _, d := range discarded {
+		if len(chosen) >= m {
+			break
+		}
+		chosen = append(chosen, d)
+	}
 	return chosen
 }
 

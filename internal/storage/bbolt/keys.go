@@ -31,6 +31,9 @@ const (
 	bktEout        = "eout"
 	bktEin         = "ein"
 	keySchemaVer   = "schema_version"
+	// bktCounters and keyCountersRecord are defined alongside the
+	// counters helpers in counters.go.
+
 )
 
 // schemaVersion bumps when the on-disk layout changes.

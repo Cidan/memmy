@@ -20,7 +20,7 @@ func TestHNSW_OracleVsFlatScan(t *testing.T) {
 		queries     = 50
 		k           = 8
 		oversample  = 200
-		recallFloor = 0.93 // mean recall@k vs flat oracle
+		recallFloor = 0.95 // mean recall@k vs flat oracle (Malkov §4 Alg.4 heuristic)
 	)
 
 	hnswCfg := bboltstore.HNSWConfig{

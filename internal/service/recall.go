@@ -213,21 +213,18 @@ func (s *Service) Recall(ctx context.Context, req types.RecallRequest) (types.Re
 		path      []string
 		viaEdge   bool
 	}
+	candByID := make(map[string]candidate, len(cands))
+	for _, c := range cands {
+		candByID[c.nodeID] = c
+	}
 	results := make([]result, 0, len(visit))
 	for nodeID, v := range visit {
 		var nodeWeight float64
 		var sim float64
-		// Find the node in cands to get sim/weight; otherwise read.
-		found := false
-		for _, c := range cands {
-			if c.nodeID == nodeID {
-				nodeWeight = c.nodeWeight
-				sim = c.sim
-				found = true
-				break
-			}
-		}
-		if !found {
+		if c, ok := candByID[nodeID]; ok {
+			nodeWeight = c.nodeWeight
+			sim = c.sim
+		} else {
 			n, err := s.graph.GetNode(ctx, tenant, nodeID)
 			if err != nil {
 				if errors.Is(err, graph.ErrNotFound) {

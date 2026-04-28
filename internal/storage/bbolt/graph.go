@@ -24,7 +24,7 @@ func (g graphAdapter) PutNode(_ context.Context, n types.Node) error {
 		return err
 	}
 	return g.s.db.Update(func(tx *bbolt.Tx) error {
-		return putNodeTx(tx, n)
+		return putNodeTxWithCounters(tx, n)
 	})
 }
 
@@ -64,6 +64,7 @@ func (g graphAdapter) UpdateNode(_ context.Context, tenant, id string, fn func(*
 		if err := decodeNode(raw, &n); err != nil {
 			return err
 		}
+		oldWeight := n.Weight
 		if err := fn(&n); err != nil {
 			return err
 		}
@@ -71,7 +72,10 @@ func (g graphAdapter) UpdateNode(_ context.Context, tenant, id string, fn func(*
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(id), buf)
+		if err := b.Put([]byte(id), buf); err != nil {
+			return err
+		}
+		return adjustCountersTx(tx, tenant, tenantCounters{SumNodeWeight: n.Weight - oldWeight})
 	})
 }
 
@@ -84,7 +88,18 @@ func (g graphAdapter) DeleteNode(_ context.Context, tenant, id string) error {
 		if b == nil {
 			return nil
 		}
-		return b.Delete([]byte(id))
+		raw := b.Get([]byte(id))
+		if raw == nil {
+			return nil
+		}
+		var n types.Node
+		if err := decodeNode(raw, &n); err != nil {
+			return err
+		}
+		if err := b.Delete([]byte(id)); err != nil {
+			return err
+		}
+		return adjustCountersTx(tx, tenant, tenantCounters{NodeCount: -1, SumNodeWeight: -n.Weight})
 	})
 }
 
@@ -149,7 +164,7 @@ func (g graphAdapter) PutEdge(_ context.Context, e types.MemoryEdge) error {
 		return err
 	}
 	return g.s.db.Update(func(tx *bbolt.Tx) error {
-		return putEdgeTx(tx, e)
+		return putEdgeTxWithCounters(tx, e)
 	})
 }
 
@@ -202,16 +217,20 @@ func (g graphAdapter) UpdateEdge(_ context.Context, tenant, from, to string, fn 
 		if err := decodeEdge(raw, &e); err != nil {
 			return err
 		}
+		oldWeight := e.Weight
 		if err := fn(&e); err != nil {
 			return err
 		}
-		return putEdgeTx(tx, e)
+		if err := writeEdgeMirrorsTx(tx, e); err != nil {
+			return err
+		}
+		return adjustCountersTx(tx, tenant, tenantCounters{SumEdgeWeight: e.Weight - oldWeight})
 	})
 }
 
 func (g graphAdapter) DeleteEdge(_ context.Context, tenant, from, to string) error {
 	return g.s.db.Update(func(tx *bbolt.Tx) error {
-		return deleteEdgeTx(tx, tenant, from, to)
+		return deleteEdgeTxWithCounters(tx, tenant, from, to)
 	})
 }
 
@@ -350,9 +369,9 @@ func einBucket(tx *bbolt.Tx, tenant string, create bool) (*bbolt.Bucket, error) 
 	return subBucket(t, bktEin, create)
 }
 
-// putNodeTx writes a Node inside an existing tx (used by service-layer
-// composition that wants to bundle multiple writes into one tx).
-func putNodeTx(tx *bbolt.Tx, n types.Node) error {
+// writeNodeRecordTx writes a node record without touching counters. Used
+// by helpers that maintain counters explicitly.
+func writeNodeRecordTx(tx *bbolt.Tx, n types.Node) error {
 	b, err := nodesBucket(tx, n.TenantID, true)
 	if err != nil {
 		return err
@@ -364,8 +383,36 @@ func putNodeTx(tx *bbolt.Tx, n types.Node) error {
 	return b.Put([]byte(n.ID), buf)
 }
 
-// putEdgeTx writes both eout/from/to and ein/to/from inside an existing tx.
-func putEdgeTx(tx *bbolt.Tx, e types.MemoryEdge) error {
+// putNodeTxWithCounters inserts (or replaces) a node and updates the
+// per-tenant counter atomically. Used by graphAdapter.PutNode.
+func putNodeTxWithCounters(tx *bbolt.Tx, n types.Node) error {
+	b, err := nodesBucket(tx, n.TenantID, true)
+	if err != nil {
+		return err
+	}
+	var oldWeight float64
+	isNew := true
+	if raw := b.Get([]byte(n.ID)); raw != nil {
+		var old types.Node
+		if err := decodeNode(raw, &old); err != nil {
+			return err
+		}
+		oldWeight = old.Weight
+		isNew = false
+	}
+	if err := writeNodeRecordTx(tx, n); err != nil {
+		return err
+	}
+	delta := tenantCounters{SumNodeWeight: n.Weight - oldWeight}
+	if isNew {
+		delta.NodeCount = 1
+	}
+	return adjustCountersTx(tx, n.TenantID, delta)
+}
+
+// writeEdgeMirrorsTx writes both eout/from/to and ein/to/from for an
+// edge without touching counters. Callers maintain counters explicitly.
+func writeEdgeMirrorsTx(tx *bbolt.Tx, e types.MemoryEdge) error {
 	buf, err := encodeEdge(&e)
 	if err != nil {
 		return err
@@ -392,16 +439,55 @@ func putEdgeTx(tx *bbolt.Tx, e types.MemoryEdge) error {
 	return tb.Put([]byte(e.From), buf)
 }
 
-// deleteEdgeTx removes both directions inside an existing tx.
-func deleteEdgeTx(tx *bbolt.Tx, tenant, from, to string) error {
+// putEdgeTxWithCounters upserts an edge in both mirrors and updates the
+// counter delta atomically.
+func putEdgeTxWithCounters(tx *bbolt.Tx, e types.MemoryEdge) error {
+	var oldWeight float64
+	isNew := true
+	if eo, _ := eoutBucket(tx, e.TenantID, false); eo != nil {
+		if fb := eo.Bucket([]byte(e.From)); fb != nil {
+			if raw := fb.Get([]byte(e.To)); raw != nil {
+				var old types.MemoryEdge
+				if err := decodeEdge(raw, &old); err != nil {
+					return err
+				}
+				oldWeight = old.Weight
+				isNew = false
+			}
+		}
+	}
+	if err := writeEdgeMirrorsTx(tx, e); err != nil {
+		return err
+	}
+	delta := tenantCounters{SumEdgeWeight: e.Weight - oldWeight}
+	if isNew {
+		delta.EdgeCount = 1
+	}
+	return adjustCountersTx(tx, e.TenantID, delta)
+}
+
+// deleteEdgeTxWithCounters removes both edge mirrors and updates the
+// counter (decrement count, subtract the deleted edge's weight).
+// Absent-edge calls are silent no-ops.
+func deleteEdgeTxWithCounters(tx *bbolt.Tx, tenant, from, to string) error {
+	var oldWeight float64
+	existed := false
 	eo, err := eoutBucket(tx, tenant, false)
 	if err != nil {
 		return err
 	}
 	if eo != nil {
 		if fb := eo.Bucket([]byte(from)); fb != nil {
-			if err := fb.Delete([]byte(to)); err != nil {
-				return err
+			if raw := fb.Get([]byte(to)); raw != nil {
+				var old types.MemoryEdge
+				if err := decodeEdge(raw, &old); err != nil {
+					return err
+				}
+				oldWeight = old.Weight
+				existed = true
+				if err := fb.Delete([]byte(to)); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -416,7 +502,10 @@ func deleteEdgeTx(tx *bbolt.Tx, tenant, from, to string) error {
 			}
 		}
 	}
-	return nil
+	if !existed {
+		return nil
+	}
+	return adjustCountersTx(tx, tenant, tenantCounters{EdgeCount: -1, SumEdgeWeight: -oldWeight})
 }
 
 // validateNode checks required fields.

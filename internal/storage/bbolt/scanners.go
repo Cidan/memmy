@@ -105,49 +105,20 @@ func (g graphAdapter) MessageIDsBefore(_ context.Context, tenant string, before 
 	return out, err
 }
 
-// TenantStats aggregates counts and weight sums across the tenant's
-// nodes and memory edges.
+// TenantStats reads the per-tenant counter record (maintained
+// transactionally by every Graph mutation) plus HNSWMeta. O(1) — does
+// NOT walk the edges or nodes buckets.
 func (g graphAdapter) TenantStats(_ context.Context, tenant string) (service.TenantStats, error) {
 	var ts service.TenantStats
 	err := g.s.db.View(func(tx *bbolt.Tx) error {
-		// Nodes
-		if nb, err := nodesBucket(tx, tenant, false); err == nil && nb != nil {
-			if err := nb.ForEach(func(_, v []byte) error {
-				var n types.Node
-				if err := decodeNode(v, &n); err != nil {
-					return err
-				}
-				ts.NodeCount++
-				ts.SumNodeWeight += n.Weight
-				return nil
-			}); err != nil {
-				return err
-			}
+		c, err := readCountersTx(tx, tenant)
+		if err != nil {
+			return err
 		}
-		// Edges (count outbound mirror only to avoid double-count).
-		if eo, err := eoutBucket(tx, tenant, false); err == nil && eo != nil {
-			if err := eo.ForEach(func(_, _ []byte) error {
-				// Each top-level key is a from-id sub-bucket.
-				return nil
-			}); err != nil {
-				return err
-			}
-			if err := eo.ForEachBucket(func(k []byte) error {
-				fb := eo.Bucket(k)
-				return fb.ForEach(func(_, v []byte) error {
-					var e types.MemoryEdge
-					if err := decodeEdge(v, &e); err != nil {
-						return err
-					}
-					ts.EdgeCount++
-					ts.SumEdgeWeight += e.Weight
-					return nil
-				})
-			}); err != nil {
-				return err
-			}
-		}
-		// HNSW size
+		ts.NodeCount = c.NodeCount
+		ts.EdgeCount = c.EdgeCount
+		ts.SumNodeWeight = c.SumNodeWeight
+		ts.SumEdgeWeight = c.SumEdgeWeight
 		if meta, ok, err := readHNSWMeta(tx, tenant); err == nil && ok {
 			ts.HNSWSize = meta.Size
 		}
