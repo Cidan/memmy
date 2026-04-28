@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Cidan/memmy/internal/config"
@@ -105,7 +106,7 @@ func TestConfig_StdioPlusMCP_Rejected(t *testing.T) {
 		t.Fatal("stdio + mcp should be rejected")
 	}
 	for _, want := range []string{"stdio", "mutually exclusive", "mcp"} {
-		if !contains(err.Error(), want) {
+		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error message %q missing %q", err.Error(), want)
 		}
 	}
@@ -161,11 +162,3 @@ func TestConfig_HTTPRequiresAddr(t *testing.T) {
 	}
 }
 
-func contains(haystack, needle string) bool {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
-	}
-	return false
-}

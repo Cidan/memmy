@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"sort"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -239,20 +241,16 @@ func (c Config) Validate() error {
 	// stdio transport owns the process's stdin/stdout exclusively, so
 	// running an HTTP listener alongside makes no sense (and would put
 	// log lines on the same stream the JSON-RPC frames travel over).
-	stdioEnabled := false
-	for _, name := range enabledNames {
-		if name == TransportStdio {
-			stdioEnabled = true
-			break
-		}
-	}
-	if stdioEnabled && len(enabledNames) > 1 {
+	if slices.Contains(enabledNames, TransportStdio) && len(enabledNames) > 1 {
 		other := make([]string, 0, len(enabledNames)-1)
 		for _, n := range enabledNames {
 			if n != TransportStdio {
 				other = append(other, n)
 			}
 		}
+		// Sort so the diagnostic is stable across runs (Go map
+		// iteration order is unspecified).
+		sort.Strings(other)
 		return fmt.Errorf("config: transport %q is mutually exclusive with all other transports; also enabled: %v", TransportStdio, other)
 	}
 	for _, name := range enabledNames {
