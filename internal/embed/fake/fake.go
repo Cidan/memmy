@@ -11,6 +11,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"math"
+
+	"github.com/Cidan/memmy/internal/embed"
 )
 
 // Embedder is a deterministic test embedder.
@@ -28,7 +30,12 @@ func New(dim int) *Embedder {
 
 func (e *Embedder) Dim() int { return e.dim }
 
-func (e *Embedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
+// Embed satisfies embed.Embedder. The fake intentionally ignores the
+// task parameter — the deterministic hash mapping is task-invariant,
+// which keeps service-level tests stable across the task-typed
+// rollout. (Production-quality task differentiation lives in the
+// gemini embedder.)
+func (e *Embedder) Embed(_ context.Context, _ embed.EmbedTask, texts []string) ([][]float32, error) {
 	out := make([][]float32, len(texts))
 	for i, t := range texts {
 		out[i] = e.vector(t)

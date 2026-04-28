@@ -173,6 +173,42 @@ Architect-flagged improvements applied without changing the architectural envelo
 - [x] `go test ./...` all green
 - [x] `go test -race ./...` all green
 
+## Round 5 — Gemini task-typed embeddings (gemini-embedding-2 default, dim 3072)
+
+### US-401 — Embedder interface carries task hint ✅
+- [x] `embed.EmbedTask` enum (Unspecified, RetrievalDocument, RetrievalQuery, plus reserved values for future tasks)
+- [x] `Embedder.Embed(ctx, task, texts)` is the new signature; all call sites updated
+
+### US-402 — Service Write uses RetrievalDocument; Recall uses RetrievalQuery ✅
+- [x] `internal/service/write.go` embeds chunks with `EmbedTaskRetrievalDocument`
+- [x] `internal/service/recall.go` embeds the query with `EmbedTaskRetrievalQuery`
+- [x] No knob exposed — task choice is hard-coded by intent
+
+### US-403 — Gemini embedder applies the task hint per model strategy ✅
+- [x] `strategyFor(model)`: gemini-embedding-001 / text-embedding-004 → `strategyParam` (sets `EmbedContentConfig.TaskType`); everything else → `strategyPrefix` (in-band prompt prefix per gemini-embedding-2 spec)
+- [x] `taskTypeAPIString` maps every documented Gemini task to the API enum string
+- [x] `promptPrefix` locks the gemini-embedding-2 strings: `"title: none | text: "`, `"task: search result | query: "`, `"task: sentence similarity | query: "`, `"task: classification | query: "`
+- [x] `EmbedContentConfig.OutputDimensionality` is set so the model returns the configured Dim
+- [x] +5 white-box unit tests in `gemini_internal_test.go` (default-strategy, known-param-models, task strings, prefix wording, doc-vs-query distinguishability)
+
+### US-404 — Default model gemini-embedding-2 / dim 3072 ✅
+- [x] `config.Default()`: `Model: "gemini-embedding-2"`, `Dim: 3072`
+- [x] `memmy.example.yaml` updated; comments explain the prefix scheme is automatic
+- [x] DESIGN.md §12 sample updated
+- [x] Validation still requires `api_key` when `backend == "gemini"`
+
+### US-405 — Documentation ✅
+- [x] DESIGN.md §5 Indexing notes RETRIEVAL_DOCUMENT at write time
+- [x] DESIGN.md §6 Retrieval notes RETRIEVAL_QUERY at recall time
+- [x] DESIGN.md §15 future-work merges model rotation and task-strategy rotation into one bullet
+- [x] This file (Round 5)
+
+### US-406 — Final regression ✅
+- [x] `go vet ./...` clean
+- [x] `go build ./...` clean
+- [x] `go test ./...` all green (104 tests across 13 packages)
+- [x] `go test -race ./...` all green
+
 ## Round 4 — Optional tenant schema (single-server, MCP-rendered)
 
 ### US-301 — Friendly YAML tenant schema in config ✅

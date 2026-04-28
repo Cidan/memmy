@@ -27,13 +27,20 @@ embedder:
   fake:
     dim: 64
   gemini:
-    model: "text-embedding-004"
+    # gemini-embedding-2 is the default. memmy applies the
+    # documented in-band task prefixes automatically:
+    #   - chunks at write time get "title: none | text: ..."
+    #   - queries at recall time get "task: search result | query: ..."
+    # No knob — memmy hard-codes the right task per operation.
+    model: "gemini-embedding-2"
     # Required when embedder.backend == "gemini". Paste your key here
     # OR generate this file from a template (envsubst, sops, etc.)
     # before passing it to memmy. memmy does not read environment
     # variables for secrets; it consumes the literal string.
     api_key: ""
-    dim: 768
+    # 3072 is gemini-embedding-2's native max dimension (Matryoshka:
+    # truncatable to 1536 or 768 for cheaper storage at minor cost).
+    dim: 3072
     concurrency: 8
 
 vector_index:

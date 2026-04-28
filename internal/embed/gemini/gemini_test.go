@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/Cidan/memmy/internal/embed"
 	"github.com/Cidan/memmy/internal/embed/gemini"
 )
 
@@ -39,7 +40,7 @@ func TestGemini_Live(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	out, err := e.Embed(ctx, []string{"hello world", "another test sentence"})
+	out, err := e.Embed(ctx, embed.EmbedTaskRetrievalDocument, []string{"hello world", "another test sentence"})
 	if err != nil {
 		t.Fatalf("Embed: %v", err)
 	}

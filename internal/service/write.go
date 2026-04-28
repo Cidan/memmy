@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Cidan/memmy/internal/chunker"
+	"github.com/Cidan/memmy/internal/embed"
 	"github.com/Cidan/memmy/internal/types"
 )
 
@@ -36,7 +37,11 @@ func (s *Service) Write(ctx context.Context, req types.WriteRequest) (types.Writ
 	for i, c := range chunks {
 		texts[i] = c.Text
 	}
-	vecs, err := s.embedder.Embed(ctx, texts)
+	// Documents being indexed for later retrieval go in as
+	// RetrievalDocument so the model tunes the vector for the
+	// "thing being searched against" side of an asymmetric pair.
+	// Recall (recall.go) uses RetrievalQuery for the inverse.
+	vecs, err := s.embedder.Embed(ctx, embed.EmbedTaskRetrievalDocument, texts)
 	if err != nil {
 		return types.WriteResult{}, err
 	}

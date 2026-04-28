@@ -162,8 +162,15 @@ func Default() Config {
 			Backend: "fake",
 			Fake:    FakeEmbedderConfig{Dim: 64},
 			Gemini: GeminiConfig{
-				Model:       "text-embedding-004",
-				Dim:         768,
+				// gemini-embedding-2 is the recommended model. It uses
+				// in-band prompt prefixes for task hints (RetrievalDoc /
+				// RetrievalQuery / etc.) — memmy's gemini embedder
+				// applies them automatically based on call intent.
+				Model: "gemini-embedding-2",
+				// 3072 is gemini-embedding-2's native max dimension
+				// (Matryoshka — operators can drop to 1536/768 if
+				// they want smaller storage at minor quality cost).
+				Dim:         3072,
 				Concurrency: 8,
 				// APIKey intentionally left empty — operators set it
 				// in their own config; memmy does not assume an env

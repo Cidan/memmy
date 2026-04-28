@@ -307,7 +307,10 @@ Write(tenantTuple, messageText, metadata) →
   2. Persist Message{...} to messages.
   3. Split text → sentences.
   4. Generate windows (size=3, stride=2).
-  5. Embed all windows in one batched call to Embedder.
+  5. Embed all windows in one batched call to Embedder, hard-coded with task=RETRIEVAL_DOCUMENT.
+     The retrieval pipeline (§6) embeds queries with task=RETRIEVAL_QUERY,
+     giving the model an asymmetric document/query pair that aligns
+     better in cosine space than task-unspecified embedding does.
   6. L2-normalize each vector.
   7. For each window:
        a. Create Node{...}; persist to nodes.
@@ -428,7 +431,10 @@ The backend's native cache (OS page cache for bbolt, buffer pool for SQL, intern
 ```
 Recall(tenantTuple, query, k=8, hops=2, oversampleN=300) →
   1. tenantTuple → tenantID.
-  2. q_vec := Embedder.Embed(query); L2-normalize.
+  2. q_vec := Embedder.Embed(query, task=RETRIEVAL_QUERY); L2-normalize.
+     Documents at write time use RETRIEVAL_DOCUMENT (§5); the asymmetric
+     pair is what gives task-typed embedders better recall than a single
+     task-unspecified call would.
   3. candidates := VectorIndex.Search(tenantID, q_vec, oversampleN)
        (flat scan or HNSW, chosen per §6.1)
   4. For each candidate c:
@@ -874,8 +880,9 @@ storage:
 embedder:
   backend: gemini
   gemini:
-    model: "text-embedding-004"
-    api_key: ""              # required for gemini; provide a literal key
+    model: "gemini-embedding-2"   # default; uses in-band task prefixes
+    api_key: ""                   # required for gemini; literal key
+    dim: 3072                     # gemini-embedding-2 native max
     concurrency: 8           # process-local semaphore limit
 
 vector_index:
@@ -1006,7 +1013,7 @@ bbolt deployments are single-node by file-lock semantics; the application is the
 - **Multi-node memmy.** Statelessness (§0 #3) means N memmy processes can run against the same multi-writer backend with no coordination. Operational concerns: load balancer, embedder rate-limit coordination if needed.
 - **Sentence splitter quality.** Rule-based first. Revisit with model-based if quality is poor.
 - **Cross-tenant search.** Out of scope for v1; would require an ACL model.
-- **Embedding model upgrades.** Strategy for rotating models without invalidating the entire index. Likely: namespace `vectors` and `hnsw_*` by `(model_name, version)` and migrate lazily on read.
+- **Embedding model + task-strategy upgrades.** Strategy for rotating models OR task hints (e.g., switching from gemini-embedding-2's `RETRIEVAL_DOCUMENT` prefix to a future model's native parameter) without invalidating the entire index. Both shifts move stored vectors out of the latent space new queries embed into. Likely fix: namespace `vectors` and `hnsw_*` by `(model_name, version, task_strategy)` and migrate lazily on read.
 - **Multi-modal memory.** Schema can extend; embedder grows accordingly.
 - **Active forgetting.** Explicit "forget topic X" RPC.
 - **HNSW deletion compaction.** Tombstones + filtered search work for v1. If churn is high, add a periodic compaction pass that hard-deletes and rebuilds affected neighbor lists.

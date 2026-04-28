@@ -7,9 +7,14 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Cidan/memmy/internal/embed"
 	"github.com/Cidan/memmy/internal/graph"
 	"github.com/Cidan/memmy/internal/types"
 )
+
+// embedTaskRetrievalQuery is a small alias to keep the import surface
+// of recall.go tight and the call site readable.
+const embedTaskRetrievalQuery = embed.EmbedTaskRetrievalQuery
 
 // Recall implements the full retrieval pipeline (DESIGN.md §6).
 //
@@ -51,7 +56,10 @@ func (s *Service) Recall(ctx context.Context, req types.RecallRequest) (types.Re
 	}
 
 	// Phase 1 — embed query.
-	embed, err := s.embedder.Embed(ctx, []string{req.Query})
+	// Queries get RetrievalQuery so the model tunes the vector for the
+	// "search input" side of the asymmetric pair (writes use
+	// RetrievalDocument — see write.go).
+	embed, err := s.embedder.Embed(ctx, embedTaskRetrievalQuery, []string{req.Query})
 	if err != nil {
 		return types.RecallResult{}, err
 	}

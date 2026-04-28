@@ -4,17 +4,20 @@ import (
 	"context"
 	"testing"
 
+	"github.com/Cidan/memmy/internal/embed"
 	"github.com/Cidan/memmy/internal/embed/fake"
 )
+
+const fakeTask = embed.EmbedTaskUnspecified
 
 func TestFake_Deterministic(t *testing.T) {
 	e := fake.New(64)
 	ctx := context.Background()
-	a, err := e.Embed(ctx, []string{"hello world"})
+	a, err := e.Embed(ctx, fakeTask, []string{"hello world"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := e.Embed(ctx, []string{"hello world"})
+	b, err := e.Embed(ctx, fakeTask, []string{"hello world"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,8 +33,8 @@ func TestFake_Deterministic(t *testing.T) {
 
 func TestFake_DistinguishesInputs(t *testing.T) {
 	e := fake.New(64)
-	a, _ := e.Embed(context.Background(), []string{"alpha"})
-	b, _ := e.Embed(context.Background(), []string{"beta"})
+	a, _ := e.Embed(context.Background(), fakeTask, []string{"alpha"})
+	b, _ := e.Embed(context.Background(), fakeTask, []string{"beta"})
 	same := true
 	for i := range a[0] {
 		if a[0][i] != b[0][i] {
@@ -46,7 +49,7 @@ func TestFake_DistinguishesInputs(t *testing.T) {
 
 func TestFake_NonZero(t *testing.T) {
 	e := fake.New(128)
-	v, _ := e.Embed(context.Background(), []string{"test"})
+	v, _ := e.Embed(context.Background(), fakeTask, []string{"test"})
 	allZero := true
 	for _, x := range v[0] {
 		if x != 0 {
