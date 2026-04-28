@@ -79,7 +79,7 @@ type EmbedderConfig struct {
 
 type GeminiConfig struct {
 	Model       string `yaml:"model"`
-	APIKeyEnv   string `yaml:"api_key_env"`
+	APIKey      string `yaml:"api_key"`
 	Dim         int    `yaml:"dim"`
 	Concurrency int    `yaml:"concurrency"`
 }
@@ -163,9 +163,11 @@ func Default() Config {
 			Fake:    FakeEmbedderConfig{Dim: 64},
 			Gemini: GeminiConfig{
 				Model:       "text-embedding-004",
-				APIKeyEnv:   "GEMINI_API_KEY",
 				Dim:         768,
 				Concurrency: 8,
+				// APIKey intentionally left empty — operators set it
+				// in their own config; memmy does not assume an env
+				// var name.
 			},
 		},
 		VectorIndex: VectorIndexConfig{
@@ -234,8 +236,8 @@ func (c Config) Validate() error {
 	}
 	switch c.Embedder.Backend {
 	case "gemini":
-		if c.Embedder.Gemini.APIKeyEnv == "" {
-			return errors.New("config: embedder.gemini.api_key_env required")
+		if c.Embedder.Gemini.APIKey == "" {
+			return errors.New("config: embedder.gemini.api_key required")
 		}
 		if c.Embedder.Gemini.Dim < 1 {
 			return errors.New("config: embedder.gemini.dim must be >= 1")

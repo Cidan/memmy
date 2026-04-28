@@ -28,7 +28,11 @@ embedder:
     dim: 64
   gemini:
     model: "text-embedding-004"
-    api_key_env: "GEMINI_API_KEY"
+    # Required when embedder.backend == "gemini". Paste your key here
+    # OR generate this file from a template (envsubst, sops, etc.)
+    # before passing it to memmy. memmy does not read environment
+    # variables for secrets; it consumes the literal string.
+    api_key: ""
     dim: 768
     concurrency: 8
 

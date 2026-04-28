@@ -162,12 +162,11 @@ func buildEmbedder(ctx context.Context, cfg config.Config) (embed.Embedder, erro
 	case "fake":
 		return fake.New(cfg.Embedder.Fake.Dim), nil
 	case "gemini":
-		key := os.Getenv(cfg.Embedder.Gemini.APIKeyEnv)
-		if key == "" {
-			return nil, fmt.Errorf("env var %s is empty", cfg.Embedder.Gemini.APIKeyEnv)
+		if cfg.Embedder.Gemini.APIKey == "" {
+			return nil, errors.New("config: embedder.gemini.api_key required")
 		}
 		return gemini.New(ctx, gemini.Options{
-			APIKey: key,
+			APIKey: cfg.Embedder.Gemini.APIKey,
 			Model:  cfg.Embedder.Gemini.Model,
 			Dim:    cfg.Embedder.Gemini.Dim,
 		})

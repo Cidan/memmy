@@ -875,7 +875,7 @@ embedder:
   backend: gemini
   gemini:
     model: "text-embedding-004"
-    api_key_env: "GEMINI_API_KEY"
+    api_key: ""              # required for gemini; provide a literal key
     concurrency: 8           # process-local semaphore limit
 
 vector_index:
