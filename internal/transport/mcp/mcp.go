@@ -162,6 +162,42 @@ type statsResult struct {
 	AvgEdgeWeight   float64 `json:"avg_edge_weight"`
 }
 
+// reinforceArgs / reinforceResult shape memory.reinforce on the wire.
+type reinforceArgs struct {
+	Tenant map[string]string `json:"tenant"`
+	NodeID string            `json:"node_id"`
+}
+
+type reinforceResult struct {
+	NodeID            string  `json:"node_id"`
+	NewWeight         float64 `json:"new_weight"`
+	SkippedRefractory bool    `json:"skipped_refractory"`
+}
+
+// demoteArgs / demoteResult shape memory.demote on the wire.
+type demoteArgs struct {
+	Tenant map[string]string `json:"tenant"`
+	NodeID string            `json:"node_id"`
+}
+
+type demoteResult struct {
+	NodeID            string  `json:"node_id"`
+	NewWeight         float64 `json:"new_weight"`
+	SkippedRefractory bool    `json:"skipped_refractory"`
+}
+
+// markArgs / markResult shape memory.mark on the wire.
+type markArgs struct {
+	Tenant   map[string]string `json:"tenant"`
+	Since    string            `json:"since"` // RFC3339
+	Strength float64           `json:"strength"`
+}
+
+type markResult struct {
+	NodesAffected          int `json:"nodes_affected"`
+	NodesSkippedRefractory int `json:"nodes_skipped_refractory"`
+}
+
 // ----- registration -----
 
 func (a *Adapter) registerTools() {
@@ -208,6 +244,47 @@ func (a *Adapter) registerTools() {
 			"Useful for sanity-checking that writes are landing, gauging corpus " +
 			"size before tuning oversample/k, or surfacing per-tenant health.",
 	}, statsArgs{}, a.handleStats)
+
+	registerToolWithTenantSchema(a.srv, a.tenantSchema, &mcpsdk.Tool{
+		Name: "memory.reinforce",
+		Description: "Tell memmy that a specific recalled memory was actually useful " +
+			"in your answer. Call this on the `node_id` of a hit from memory.recall " +
+			"that you cited, used as evidence, or otherwise built your response " +
+			"around — not on every hit, only on the ones that earned their keep. " +
+			"This is the primary signal memmy has that a memory is paying off, " +
+			"so over time reinforced memories surface earlier and more reliably " +
+			"for similar future questions. Costs nothing to call but only matters " +
+			"when used selectively. Repeat reinforcement on the same hit within " +
+			"a short window has no extra effect — one signal per useful retrieval " +
+			"is enough.",
+	}, reinforceArgs{}, a.handleReinforce)
+
+	registerToolWithTenantSchema(a.srv, a.tenantSchema, &mcpsdk.Tool{
+		Name: "memory.demote",
+		Description: "Tell memmy that a specific recalled memory was misleading, " +
+			"contradicted, outdated, or otherwise wrong for the current question. " +
+			"Call this on the `node_id` of a hit from memory.recall that steered " +
+			"you wrong or that you had to disregard. The memory is NOT deleted — " +
+			"it stays addressable and can recover if it proves useful later — but " +
+			"it ranks lower in future retrievals. Use this in preference to " +
+			"memory.forget unless the content must be erased outright (corrected " +
+			"misinformation, secrets, explicit user request).",
+	}, demoteArgs{}, a.handleDemote)
+
+	registerToolWithTenantSchema(a.srv, a.tenantSchema, &mcpsdk.Tool{
+		Name: "memory.mark",
+		Description: "Retroactively boost everything memmy learned during a stretch " +
+			"of conversation that turned out to matter. Call this once at a " +
+			"natural endpoint — after solving a thorny problem, completing a " +
+			"task that depended on multiple recalled facts, or any moment where " +
+			"the recent context (not a single hit) is worth keeping warm. " +
+			"`since` is the RFC3339 timestamp from when the relevant context " +
+			"started. `strength` is 0–1; use 1.0 for 'this whole arc was " +
+			"important', 0.3 for 'mildly worth remembering'. Most useful at " +
+			"the end of a long debugging session, after a meaningful decision, " +
+			"or once a project milestone is reached. Do not call after every " +
+			"turn — reserve it for stretches that produced real value.",
+	}, markArgs{}, a.handleMark)
 }
 
 // registerToolWithTenantSchema is a small wrapper around mcp.AddTool
@@ -349,6 +426,79 @@ func (a *Adapter) handleForget(ctx context.Context, _ *mcpsdk.CallToolRequest, a
 		DeletedEdges:   out.DeletedEdges,
 		DeletedVectors: out.DeletedVectors,
 	}, nil
+}
+
+func (a *Adapter) handleReinforce(ctx context.Context, _ *mcpsdk.CallToolRequest, args reinforceArgs) (*mcpsdk.CallToolResult, reinforceResult, error) {
+	if args.NodeID == "" {
+		return nil, reinforceResult{}, fmt.Errorf("memory.reinforce: node_id required")
+	}
+	out, err := a.svc.Reinforce(ctx, types.ReinforceRequest{
+		Tenant: args.Tenant,
+		NodeID: args.NodeID,
+	})
+	if err != nil {
+		if r := a.tenantErrorResult(err); r != nil {
+			return r, reinforceResult{}, nil
+		}
+		return nil, reinforceResult{}, err
+	}
+	r := reinforceResult{
+		NodeID:            out.NodeID,
+		NewWeight:         out.NewWeight,
+		SkippedRefractory: out.SkippedRefractory,
+	}
+	return summary(r), r, nil
+}
+
+func (a *Adapter) handleDemote(ctx context.Context, _ *mcpsdk.CallToolRequest, args demoteArgs) (*mcpsdk.CallToolResult, demoteResult, error) {
+	if args.NodeID == "" {
+		return nil, demoteResult{}, fmt.Errorf("memory.demote: node_id required")
+	}
+	out, err := a.svc.Demote(ctx, types.DemoteRequest{
+		Tenant: args.Tenant,
+		NodeID: args.NodeID,
+	})
+	if err != nil {
+		if r := a.tenantErrorResult(err); r != nil {
+			return r, demoteResult{}, nil
+		}
+		return nil, demoteResult{}, err
+	}
+	r := demoteResult{
+		NodeID:            out.NodeID,
+		NewWeight:         out.NewWeight,
+		SkippedRefractory: out.SkippedRefractory,
+	}
+	return summary(r), r, nil
+}
+
+func (a *Adapter) handleMark(ctx context.Context, _ *mcpsdk.CallToolRequest, args markArgs) (*mcpsdk.CallToolResult, markResult, error) {
+	if args.Since == "" {
+		return nil, markResult{}, fmt.Errorf("memory.mark: since required (RFC3339 timestamp)")
+	}
+	since, err := time.Parse(time.RFC3339, args.Since)
+	if err != nil {
+		return nil, markResult{}, fmt.Errorf("memory.mark: invalid since timestamp: %w", err)
+	}
+	if args.Strength <= 0 {
+		return nil, markResult{}, fmt.Errorf("memory.mark: strength must be > 0")
+	}
+	out, err := a.svc.Mark(ctx, types.MarkRequest{
+		Tenant:   args.Tenant,
+		Since:    since,
+		Strength: args.Strength,
+	})
+	if err != nil {
+		if r := a.tenantErrorResult(err); r != nil {
+			return r, markResult{}, nil
+		}
+		return nil, markResult{}, err
+	}
+	r := markResult{
+		NodesAffected:          out.NodesAffected,
+		NodesSkippedRefractory: out.NodesSkippedRefractory,
+	}
+	return summary(r), r, nil
 }
 
 func (a *Adapter) handleStats(ctx context.Context, _ *mcpsdk.CallToolRequest, args statsArgs) (*mcpsdk.CallToolResult, statsResult, error) {

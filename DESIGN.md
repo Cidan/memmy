@@ -568,9 +568,34 @@ stored.LastTouched = now
 
 Read-modify-write happens inside one storage transaction via `Graph.UpdateNode` / `Graph.UpdateEdge` (closure form, see §9).
 
-### 8.2 Reinforcement — capped
+### 8.2 Reinforcement — implicit and explicit paths
 
-Default: cap-only with `weightCap = 100.0`. Combined with decay, steady-state weight is proportional to access frequency, bounded by `weightCap`. Move to log-dampening if the cap proves too coarse.
+memmy distinguishes two reinforcement paths against the same `Node.Weight` axis:
+
+- **Implicit** (Recall co-retrieval / co-traversal). Each Recall bumps every retrieved node's weight by `NodeDelta`. This path is **not** refractory-gated and **not** log-dampened: it is the always-on Hebbian signal.
+- **Explicit** (`Reinforce`, `Demote`, `Mark` — caller-driven). The caller asserts a quality signal: "this hit was useful," "this hit was wrong," or "this whole window mattered." This path applies a per-node refractory gate and (for positive bumps) log-dampening. It corresponds to the dopaminergic / synaptic-tag-capture analog: the agent's outcome signals shape the corpus, where implicit Hebbian co-retrieval cannot.
+
+**Steady-state under cap.** Without dampening, decay + bumps + cap give steady-state weight proportional to access frequency, bounded by `weightCap`. Frequently-touched nodes saturate at `weightCap`; ranking still works because decay un-saturates them when access stops.
+
+**Log-dampening (explicit positive bumps only).** When `LogDampening = true`, an explicit positive `delta` is rescaled before being added to the decayed weight:
+
+```
+effective_delta = delta * (1 - decayed_weight / weightCap)        # delta > 0
+                = delta                                            # delta <= 0
+```
+
+Saturation becomes asymptotic: the closer the weight is to `weightCap`, the smaller each subsequent reinforcement. A misbehaving caller that fires `Reinforce` repeatedly cannot push every touched node onto the cap and homogenize the corpus. Demote is unaffected — negative deltas always apply at full magnitude (clamped at `NodeFloor`).
+
+**Refractory period (explicit bumps only).** The same node cannot accept two explicit bumps within `RefractoryPeriod` (default 60 s). Inside the closure, if `now - LastTouched < RefractoryPeriod`, the bump is dropped — the call still updates `LastTouched` and `AccessCount`, lazy decay still runs, but no `delta` is applied. This prevents:
+
+- Double-counting when a single retrieved hit is `Reinforce`d immediately after the implicit Recall co-retrieval bump on the same node.
+- Loop-spam pathologies where a stuck caller fires the same op many times per second.
+
+The biological analog is the post-LTP synaptic refractory window plus metaplasticity (BCM theory): recently-potentiated synapses raise their LTP threshold, so additional stimulation has reduced effect. `RefractoryPeriod = 0` disables the gate.
+
+**Demote semantics.** `Demote` adds a negative `delta` (`-NodeDelta` by default) and clamps the post-update weight at `NodeFloor`. The node is **never** deleted — it stays addressable and its content survives. Hard delete is `Forget` only.
+
+**Mark semantics.** `Mark(tenant, since, strength)` walks every node whose `CreatedAt ≥ since`, capped by `MarkMaxNodes`. Per-node delta is `strength * NodeDelta * recency`, where `recency = 1 - (now - CreatedAt) / (now - since)` linearly scales from `1` at the most recently created node to `0` at the window edge. Each per-node application goes through the same refractory + log-dampening path. This is the synaptic-tag-capture analog: a strong event late in a session retroactively boosts the recently-encoded weak memories that built up to it.
 
 ### 8.3 Decay rates
 
@@ -639,6 +664,12 @@ type MemoryService interface {
     Recall(ctx context.Context, req RecallRequest) (RecallResult, error)
     Forget(ctx context.Context, req ForgetRequest) (ForgetResult, error)
     Stats(ctx context.Context, req StatsRequest) (StatsResult, error)
+
+    // Explicit caller-driven reinforcement (DESIGN.md §8.2). All three
+    // go through the refractory + log-dampening path on Node.Weight.
+    Reinforce(ctx context.Context, req ReinforceRequest) (ReinforceResult, error)
+    Demote(ctx context.Context, req DemoteRequest) (DemoteResult, error)
+    Mark(ctx context.Context, req MarkRequest) (MarkResult, error)
 }
 
 type WriteRequest struct {
@@ -697,6 +728,39 @@ type StatsResult struct {
     HNSWSize        int
     AvgNodeWeight   float64
     AvgEdgeWeight   float64
+}
+
+// Explicit caller-driven reinforcement (§8.2). All three operations
+// share the same refractory + log-dampening path on Node.Weight.
+
+type ReinforceRequest struct {
+    Tenant map[string]string
+    NodeID string
+}
+type ReinforceResult struct {
+    NodeID            string
+    NewWeight         float64
+    SkippedRefractory bool
+}
+
+type DemoteRequest struct {
+    Tenant map[string]string
+    NodeID string
+}
+type DemoteResult struct {
+    NodeID            string
+    NewWeight         float64
+    SkippedRefractory bool
+}
+
+type MarkRequest struct {
+    Tenant   map[string]string
+    Since    time.Time
+    Strength float64 // > 0; scales the per-node delta
+}
+type MarkResult struct {
+    NodesAffected          int
+    NodesSkippedRefractory int
 }
 ```
 
@@ -795,12 +859,15 @@ These two transports are **mutually exclusive** at the config level. `stdio` own
 
 Tools registered (identical schema across both transports):
 
-| MCP tool         | Args (JSON)                                                  | Result (JSON)                                                  | Maps to       |
-|------------------|--------------------------------------------------------------|----------------------------------------------------------------|---------------|
-| `memory.write`   | `{tenant, message, metadata?}`                               | `{message_id, node_ids[]}`                                     | `Write`       |
-| `memory.recall`  | `{tenant, query, k?, hops?, oversample?}`                    | `{results[]}` (see §6.6)                                       | `Recall`      |
-| `memory.forget`  | `{tenant, message_id?, before?}`                             | `{deleted_nodes, deleted_edges, deleted_vectors}`              | `Forget`      |
-| `memory.stats`   | `{tenant?}`                                                  | `{node_count, memory_edge_count, hnsw_size, avg_*_weight}`     | `Stats`       |
+| MCP tool           | Args (JSON)                                                  | Result (JSON)                                                  | Maps to       |
+|--------------------|--------------------------------------------------------------|----------------------------------------------------------------|---------------|
+| `memory.write`     | `{tenant, message, metadata?}`                               | `{message_id, node_ids[]}`                                     | `Write`       |
+| `memory.recall`    | `{tenant, query, k?, hops?, oversample?}`                    | `{results[]}` (see §6.6)                                       | `Recall`      |
+| `memory.forget`    | `{tenant, message_id?, before?}`                             | `{deleted_nodes, deleted_edges, deleted_vectors}`              | `Forget`      |
+| `memory.stats`     | `{tenant?}`                                                  | `{node_count, memory_edge_count, hnsw_size, avg_*_weight}`     | `Stats`       |
+| `memory.reinforce` | `{tenant, node_id}`                                          | `{node_id, new_weight, skipped_refractory}`                    | `Reinforce`   |
+| `memory.demote`    | `{tenant, node_id}`                                          | `{node_id, new_weight, skipped_refractory}`                    | `Demote`      |
+| `memory.mark`      | `{tenant, since (RFC3339), strength}`                        | `{nodes_affected, nodes_skipped_refractory}`                   | `Mark`        |
 
 The streamable transport allows long retrievals to yield partial results progressively (seeds first, then expanded set). Optional in v1; can return unary initially without an API break since results are already shaped as a list.
 
@@ -900,6 +967,19 @@ memory:
   retrieval_k:        8
   retrieval_hops:     2
   retrieval_oversample: 300
+
+  # Per-node refractory window for explicit Reinforce/Demote/Mark calls
+  # (§8.2). Implicit Recall co-retrieval bumps are NOT throttled. Set 0
+  # to disable.
+  refractory_period: 60s
+
+  # When true, positive Reinforce/Mark deltas scale by (1 - w/weight_cap)
+  # so saturation is asymptotic instead of a hard wall (§8.2). Demote
+  # bypasses dampening.
+  log_dampening: true
+
+  # Maximum number of recent nodes a single memory.mark call walks.
+  mark_max_nodes: 256
 
   scoring:
     sim_alpha:    1.0

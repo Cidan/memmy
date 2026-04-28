@@ -110,6 +110,20 @@ type MemoryConfig struct {
 	StructuralRecentN    int           `yaml:"structural_recent_n"`
 	StructuralRecentDelta time.Duration `yaml:"structural_recent_delta"`
 
+	// RefractoryPeriod blocks repeated explicit Reinforce/Demote/Mark
+	// bumps on the same node within the window. Implicit Recall
+	// co-retrieval bumps are NOT throttled. Set to 0 to disable.
+	RefractoryPeriod time.Duration `yaml:"refractory_period"`
+
+	// LogDampening scales positive Reinforce/Mark deltas by
+	// (1 - weight/WeightCap), so saturation is asymptotic instead of a
+	// hard wall. Demote is unaffected.
+	LogDampening bool `yaml:"log_dampening"`
+
+	// MarkMaxNodes caps the number of recent nodes a single Mark call
+	// will walk.
+	MarkMaxNodes int `yaml:"mark_max_nodes"`
+
 	Scoring   ScoringConfig   `yaml:"scoring"`
 	Decay     DecayConfig     `yaml:"decay"`
 	Reinforce ReinforceConfig `yaml:"reinforce"`
@@ -195,6 +209,9 @@ func Default() Config {
 			RetrievalOversample:   300,
 			StructuralRecentN:     16,
 			StructuralRecentDelta: 5 * time.Minute,
+			RefractoryPeriod:      60 * time.Second,
+			LogDampening:          true,
+			MarkMaxNodes:          256,
 			Scoring:               ScoringConfig{SimAlpha: 1.0, WeightBeta: 0.5},
 			Decay: DecayConfig{
 				NodeLambda:            8.0e-8,

@@ -13,6 +13,10 @@ import (
 // applyNodeDecayReinforce runs lazy-decay-then-reinforce on a node within
 // a single Graph.UpdateNode tx. Returns the post-update Node so callers
 // can use the fresh weight for ranking without a separate read.
+//
+// This is the IMPLICIT path used by Recall co-retrieval: not refractory-
+// gated and not log-dampened. Explicit caller-driven Reinforce/Demote/Mark
+// go through applyExplicitNodeBump instead.
 func (s *Service) applyNodeDecayReinforce(ctx context.Context, tenant, nodeID string, delta float64) (types.Node, error) {
 	var out types.Node
 	err := s.graph.UpdateNode(ctx, tenant, nodeID, func(n *types.Node) error {
@@ -24,6 +28,63 @@ func (s *Service) applyNodeDecayReinforce(ctx context.Context, tenant, nodeID st
 		return nil
 	})
 	return out, err
+}
+
+// applyExplicitNodeBump runs lazy-decay-then-(refractory-gated, log-dampened)
+// reinforcement on a node. This is the EXPLICIT path used by the
+// caller-driven Reinforce, Demote, and Mark operations.
+//
+// Positive delta is reinforced and, when LogDampening is on, scaled by
+// (1 - decayed_weight / WeightCap) so repeated bumps approach the cap
+// asymptotically. Negative delta is applied at full magnitude and the
+// post-update weight is clamped at NodeFloor — Demote never deletes.
+//
+// Refractory: when (now - LastTouched) < RefractoryPeriod, the delta
+// is dropped (returned `skipped` is true) but LastTouched and
+// AccessCount are still updated and lazy decay still runs.
+// RefractoryPeriod = 0 disables the gate.
+//
+// All work happens inside one Graph.UpdateNode transaction.
+func (s *Service) applyExplicitNodeBump(ctx context.Context, tenant, nodeID string, delta float64) (types.Node, bool, error) {
+	var out types.Node
+	var skipped bool
+	err := s.graph.UpdateNode(ctx, tenant, nodeID, func(n *types.Node) error {
+		// Reset on every invocation: MVCC backends may retry this
+		// closure on serialization conflict, and only the final
+		// invocation's outcome is what lands in the database.
+		skipped = false
+
+		now := s.clock.Now()
+		decayed := decay(n.Weight, s.cfg.NodeLambda, now.Sub(n.LastTouched))
+
+		eff := delta
+		if s.cfg.RefractoryPeriod > 0 && now.Sub(n.LastTouched) < s.cfg.RefractoryPeriod {
+			eff = 0
+			skipped = true
+		}
+		if eff > 0 && s.cfg.LogDampening && s.cfg.WeightCap > 0 {
+			scale := 1.0 - decayed/s.cfg.WeightCap
+			if scale < 0 {
+				scale = 0
+			}
+			eff = eff * scale
+		}
+
+		newWeight := decayed + eff
+		if s.cfg.WeightCap > 0 && newWeight > s.cfg.WeightCap {
+			newWeight = s.cfg.WeightCap
+		}
+		if newWeight < s.cfg.NodeFloor {
+			newWeight = s.cfg.NodeFloor
+		}
+
+		n.Weight = newWeight
+		n.LastTouched = now
+		n.AccessCount++
+		out = *n
+		return nil
+	})
+	return out, skipped, err
 }
 
 // applyEdgeDecayReinforce runs lazy-decay-then-reinforce on an edge,

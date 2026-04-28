@@ -29,6 +29,9 @@ type MemoryService interface {
 	Recall(ctx context.Context, req types.RecallRequest) (types.RecallResult, error)
 	Forget(ctx context.Context, req types.ForgetRequest) (types.ForgetResult, error)
 	Stats(ctx context.Context, req types.StatsRequest) (types.StatsResult, error)
+	Reinforce(ctx context.Context, req types.ReinforceRequest) (types.ReinforceResult, error)
+	Demote(ctx context.Context, req types.DemoteRequest) (types.DemoteResult, error)
+	Mark(ctx context.Context, req types.MarkRequest) (types.MarkResult, error)
 }
 
 // Service is the concrete MemoryService implementation.
@@ -78,6 +81,22 @@ type Config struct {
 	// Structural temporal recency
 	StructuralRecentN     int
 	StructuralRecentDelta time.Duration
+
+	// Explicit-bump throttling (Reinforce/Demote/Mark only).
+	// RefractoryPeriod blocks repeated explicit bumps on the same node
+	// within the window — the call still updates LastTouched and
+	// AccessCount but applies no delta. Implicit Recall co-retrieval
+	// bumps are NOT refractory-gated. Set to 0 to disable.
+	RefractoryPeriod time.Duration
+
+	// LogDampening makes positive bumps approach WeightCap asymptotically
+	// instead of hitting a hard wall: effective_delta = delta * (1 - w/cap).
+	// Demote (negative delta) is unaffected. Implicit Recall co-retrieval
+	// bumps are NOT log-dampened.
+	LogDampening bool
+
+	// MarkMaxNodes caps the number of recent nodes Mark walks per call.
+	MarkMaxNodes int
 }
 
 // DefaultConfig returns the documented defaults from DESIGN.md §12.
@@ -109,6 +128,10 @@ func DefaultConfig() Config {
 
 		StructuralRecentN:     16,
 		StructuralRecentDelta: 5 * time.Minute,
+
+		RefractoryPeriod: 60 * time.Second,
+		LogDampening:     true,
+		MarkMaxNodes:     256,
 	}
 }
 

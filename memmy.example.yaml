@@ -61,6 +61,20 @@ memory:
   structural_recent_n: 16
   structural_recent_delta: 5m
 
+  # Per-node refractory period for explicit Reinforce/Demote/Mark calls.
+  # If the same node is touched again within this window, the bump is
+  # skipped (the call still records the access). Implicit Recall
+  # co-retrieval bumps are NOT throttled. Set to 0 to disable.
+  refractory_period: 60s
+
+  # When true, positive Reinforce/Mark deltas scale by (1 - w/weight_cap)
+  # so repeated reinforcement approaches weight_cap asymptotically
+  # instead of slamming into it. Demote is unaffected.
+  log_dampening: true
+
+  # Maximum number of recent nodes a single memory.mark call will walk.
+  mark_max_nodes: 256
+
   scoring:
     sim_alpha: 1.0
     weight_beta: 0.5

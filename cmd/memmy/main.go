@@ -204,6 +204,10 @@ func serviceConfigFromYAML(cfg config.Config) service.Config {
 
 		StructuralRecentN:     cfg.Memory.StructuralRecentN,
 		StructuralRecentDelta: cfg.Memory.StructuralRecentDelta,
+
+		RefractoryPeriod: cfg.Memory.RefractoryPeriod,
+		LogDampening:     cfg.Memory.LogDampening,
+		MarkMaxNodes:     cfg.Memory.MarkMaxNodes,
 	}
 }
 

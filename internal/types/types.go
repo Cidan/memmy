@@ -215,3 +215,46 @@ type StatsResult struct {
 	AvgNodeWeight   float64
 	AvgEdgeWeight   float64
 }
+
+// ReinforceRequest / ReinforceResult — explicit, caller-driven LTP bump
+// on a single node. The caller indicates "this hit was useful in my
+// answer." See DESIGN.md §8.2.
+type ReinforceRequest struct {
+	Tenant map[string]string
+	NodeID string
+}
+
+type ReinforceResult struct {
+	NodeID            string
+	NewWeight         float64
+	SkippedRefractory bool
+}
+
+// DemoteRequest / DemoteResult — explicit, caller-driven inhibition on
+// a single node. The caller indicates "this hit was misleading or
+// wrong." Weight is clamped at NodeFloor; the node is never deleted.
+type DemoteRequest struct {
+	Tenant map[string]string
+	NodeID string
+}
+
+type DemoteResult struct {
+	NodeID            string
+	NewWeight         float64
+	SkippedRefractory bool
+}
+
+// MarkRequest / MarkResult — retroactively boost every node in the
+// tenant whose CreatedAt falls within [Since, now]. Strength scales
+// the per-node delta; older nodes within the window receive a smaller
+// share. See DESIGN.md §8.2.
+type MarkRequest struct {
+	Tenant   map[string]string
+	Since    time.Time
+	Strength float64
+}
+
+type MarkResult struct {
+	NodesAffected          int
+	NodesSkippedRefractory int
+}

@@ -69,10 +69,235 @@ func TestMCP_ToolList(t *testing.T) {
 		}
 		got[tool.Name] = true
 	}
-	for _, want := range []string{"memory.write", "memory.recall", "memory.forget", "memory.stats"} {
+	for _, want := range []string{
+		"memory.write", "memory.recall", "memory.forget", "memory.stats",
+		"memory.reinforce", "memory.demote", "memory.mark",
+	} {
 		if !got[want] {
 			t.Errorf("missing tool: %s", want)
 		}
+	}
+}
+
+// connectWithFixture builds the MCP test rig and returns the client
+// session plus the underlying FakeClock so tests can drive time forward
+// to escape the refractory window or advance Mark windows.
+func connectWithFixture(t *testing.T) (*mcpsdk.ClientSession, *clock.Fake) {
+	t.Helper()
+	store, err := bboltstore.Open(bboltstore.Options{
+		Path: filepath.Join(t.TempDir(), "memmy.db"),
+		Dim:  32, RandSeed: 42,
+		FlatScanThreshold: 100000,
+	})
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cl := clock.NewFake(time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC))
+
+	svc, err := service.New(
+		store.Graph(), store.VectorIndex(),
+		fake.New(32),
+		cl,
+		service.DefaultConfig(),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("service: %v", err)
+	}
+	adapter := mcpadapter.New(svc, nil)
+
+	t1, t2 := mcpsdk.NewInMemoryTransports()
+	if _, err := adapter.Server().Connect(context.Background(), t1, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "test-client", Version: "v0.0.1"}, nil)
+	cs, err := client.Connect(context.Background(), t2, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+	return cs, cl
+}
+
+func TestMCP_Reinforce_RoundTrip(t *testing.T) {
+	cs, cl := connectWithFixture(t)
+	ctx := context.Background()
+
+	// Seed a node via memory.write.
+	wres, err := cs.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: "memory.write",
+		Arguments: map[string]any{
+			"tenant":  map[string]string{"agent": "ada"},
+			"message": "alpha sentence. beta sentence. gamma sentence.",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var write struct {
+		MessageID string   `json:"message_id"`
+		NodeIDs   []string `json:"node_ids"`
+	}
+	if err := decodeStructured(wres, &write); err != nil {
+		t.Fatal(err)
+	}
+	if len(write.NodeIDs) == 0 {
+		t.Fatal("write returned no nodes")
+	}
+
+	// Advance past the refractory window.
+	cl.Advance(2 * time.Minute)
+
+	rres, err := cs.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: "memory.reinforce",
+		Arguments: map[string]any{
+			"tenant":  map[string]string{"agent": "ada"},
+			"node_id": write.NodeIDs[0],
+		},
+	})
+	if err != nil {
+		t.Fatalf("reinforce: %v", err)
+	}
+	if rres.IsError {
+		t.Fatalf("reinforce result is error: %s", textPayload(rres))
+	}
+	var rout struct {
+		NodeID            string  `json:"node_id"`
+		NewWeight         float64 `json:"new_weight"`
+		SkippedRefractory bool    `json:"skipped_refractory"`
+	}
+	if err := decodeStructured(rres, &rout); err != nil {
+		t.Fatal(err)
+	}
+	if rout.NodeID != write.NodeIDs[0] {
+		t.Fatalf("returned node_id mismatch: got %s want %s", rout.NodeID, write.NodeIDs[0])
+	}
+	if rout.NewWeight <= 1.0 {
+		t.Fatalf("expected new_weight > 1.0, got %v", rout.NewWeight)
+	}
+	if rout.SkippedRefractory {
+		t.Fatal("first reinforce after refractory window should not be skipped")
+	}
+}
+
+func TestMCP_Demote_RoundTrip(t *testing.T) {
+	cs, cl := connectWithFixture(t)
+	ctx := context.Background()
+
+	wres, err := cs.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: "memory.write",
+		Arguments: map[string]any{
+			"tenant":  map[string]string{"agent": "ada"},
+			"message": "doomed sentence. cursed sentence. wrong sentence.",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var write struct {
+		NodeIDs []string `json:"node_ids"`
+	}
+	if err := decodeStructured(wres, &write); err != nil {
+		t.Fatal(err)
+	}
+	cl.Advance(2 * time.Minute)
+
+	dres, err := cs.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: "memory.demote",
+		Arguments: map[string]any{
+			"tenant":  map[string]string{"agent": "ada"},
+			"node_id": write.NodeIDs[0],
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dres.IsError {
+		t.Fatalf("demote result is error: %s", textPayload(dres))
+	}
+	var dout struct {
+		NewWeight float64 `json:"new_weight"`
+	}
+	if err := decodeStructured(dres, &dout); err != nil {
+		t.Fatal(err)
+	}
+	// Default NodeFloor=0.01; default NodeDelta=1.0; initial weight=1.0
+	// → demoted weight clamps at NodeFloor.
+	if dout.NewWeight < 0 {
+		t.Fatalf("demote produced negative weight: %v", dout.NewWeight)
+	}
+	if dout.NewWeight >= 1.0 {
+		t.Fatalf("demote did not reduce weight: got %v want < 1.0", dout.NewWeight)
+	}
+}
+
+func TestMCP_Mark_RoundTrip(t *testing.T) {
+	cs, cl := connectWithFixture(t)
+	ctx := context.Background()
+
+	since := cl.Now()
+	// Open the window before any writes.
+	cl.Advance(30 * time.Minute)
+	if _, err := cs.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: "memory.write",
+		Arguments: map[string]any{
+			"tenant":  map[string]string{"agent": "ada"},
+			"message": "newly. written. content.",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Advance further so the in-window nodes are past their refractory
+	// window from the Write that created them.
+	cl.Advance(30 * time.Minute)
+
+	mres, err := cs.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: "memory.mark",
+		Arguments: map[string]any{
+			"tenant":   map[string]string{"agent": "ada"},
+			"since":    since.Format(time.RFC3339),
+			"strength": 1.0,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mres.IsError {
+		t.Fatalf("mark result is error: %s", textPayload(mres))
+	}
+	var mout struct {
+		NodesAffected          int `json:"nodes_affected"`
+		NodesSkippedRefractory int `json:"nodes_skipped_refractory"`
+	}
+	if err := decodeStructured(mres, &mout); err != nil {
+		t.Fatal(err)
+	}
+	if mout.NodesAffected == 0 {
+		t.Fatalf("mark affected zero nodes (skipped=%d)", mout.NodesSkippedRefractory)
+	}
+}
+
+func TestMCP_Reinforce_TenantValidationError(t *testing.T) {
+	cs := connectWithSchema(t, projectScopeSchemaForMCP(t))
+	ctx := context.Background()
+	res, err := cs.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: "memory.reinforce",
+		Arguments: map[string]any{
+			// Missing one_of: neither project nor scope present.
+			"tenant":  map[string]string{},
+			"node_id": "01J0000000000000000000XXXX",
+		},
+	})
+	// Mirror the surface-flexibility of the existing tenant-error tests:
+	// either a JSON-RPC error or an IsError result is acceptable, both
+	// give the LLM enough signal.
+	if err != nil {
+		return
+	}
+	if !res.IsError {
+		t.Fatalf("expected error result for empty tenant; got %+v", res)
 	}
 }
 
