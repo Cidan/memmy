@@ -469,6 +469,12 @@ func putEdgeTxWithCounters(tx *bbolt.Tx, e types.MemoryEdge) error {
 // deleteEdgeTxWithCounters removes both edge mirrors and updates the
 // counter (decrement count, subtract the deleted edge's weight).
 // Absent-edge calls are silent no-ops.
+//
+// The eout mirror is treated as authoritative for "did this edge
+// exist?" — the ein delete is best-effort cleanup and silently no-ops
+// if the entry is already gone. The public Graph API never produces
+// asymmetric mirror state because PutEdge / UpdateEdge / DeleteEdge
+// all touch both mirrors inside one tx.
 func deleteEdgeTxWithCounters(tx *bbolt.Tx, tenant, from, to string) error {
 	var oldWeight float64
 	existed := false

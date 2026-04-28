@@ -9,7 +9,6 @@ import (
 
 	"go.etcd.io/bbolt"
 
-	gport "github.com/Cidan/memmy/internal/graph"
 	"github.com/Cidan/memmy/internal/service"
 	bboltstore "github.com/Cidan/memmy/internal/storage/bbolt"
 	"github.com/Cidan/memmy/internal/types"
@@ -287,5 +286,3 @@ func nearlyEqual(a, b float64) bool {
 	return d < 1e-6
 }
 
-// silence unused imports in case test build conditions exclude callers
-var _ = gport.ErrNotFound
