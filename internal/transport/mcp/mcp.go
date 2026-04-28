@@ -233,20 +233,18 @@ func (a *Adapter) tenantErrorResult(err error) *mcpsdk.CallToolResult {
 	}
 	payload, perr := te.Payload(expected)
 	if perr != nil {
-		// Fall back to plain message if marshalling somehow fails.
-		payload = []byte(`{"error_code":"tenant_invalid","message":` + jsonString(te.Message) + `}`)
+		// Fall back to a minimal envelope if marshalling the schema
+		// somehow fails. Same shape, just without expected_schema.
+		fallback := struct {
+			ErrorCode string `json:"error_code"`
+			Message   string `json:"message"`
+		}{ErrorCode: "tenant_invalid", Message: te.Message}
+		payload, _ = json.Marshal(fallback)
 	}
 	return &mcpsdk.CallToolResult{
 		IsError: true,
 		Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: string(payload)}},
 	}
-}
-
-// jsonString trivially escapes a string into a quoted JSON string for
-// fallback error formatting.
-func jsonString(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
 }
 
 // ----- handlers -----

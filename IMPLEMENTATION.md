@@ -188,7 +188,7 @@ Architect-flagged improvements applied without changing the architectural envelo
 - [x] `Service.New` accepts an optional schema; nil = accept any tuple (unchanged path)
 - [x] `Service.Write/Recall/Forget/Stats` validate tenant before deriving `TenantID`
 - [x] No stored-tenant migration: `TenantID` is purely a hash of the validated tuple, so changing the schema and changing back leaves prior memories addressable
-- [x] +11 unit tests in tenant_schema_test.go covering every validation rule, JSON schema shape, and payload round-trip
+- [x] +12 unit tests in tenant_schema_test.go covering every validation rule, JSON schema shape, and payload round-trip
 
 ### US-303 — MCP adapter renders schema into the tool surface ✅
 - [x] `mcpadapter.New` takes an optional `*service.TenantSchema`; when set, every tool's auto-derived InputSchema has its `tenant` property replaced with the rendered JSON Schema
