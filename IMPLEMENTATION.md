@@ -282,3 +282,33 @@ Architect-flagged improvements applied without changing the architectural envelo
 - [x] `go build ./...` clean
 - [x] `go test ./...` all green (**94 tests across 13 packages**)
 - [x] `go test -race ./...` all green
+
+## Round 7 — Library facade for in-process embedding
+
+memmy is now embeddable directly via `import "github.com/Cidan/memmy"`. The daemon (`cmd/memmy`) and the library share the same `MemoryService`; the facade simply skips the transport layer.
+
+### US-701 — Facade package at module root ✅
+- [x] `memmy.go` defines `package memmy` at the module root
+- [x] Re-exports `Service` (= `service.MemoryService`) plus every request/result value type from `internal/types` via Go type aliases (`WriteRequest`, `RecallRequest`, `RecallHit`, `ScoreBreakdown`, `Forget*`, `Stats*`, `Reinforce*`, `Demote*`, `Mark*`, `EdgeKind` and its three constants)
+- [x] Re-exports `Embedder` and `EmbedTask` (with all task constants), `Clock` / `RealClock` / `FakeClock`, `ServiceConfig` (= `service.Config`), `TenantSchema` / `TenantSchemaConfig` / `TenantKeyConfig`, `ErrTenantInvalid`, `HNSWConfig`
+- [x] Constructors: `NewFakeEmbedder(dim)`, `NewGeminiEmbedder(ctx, GeminiEmbedderOptions)`, `NewFakeClock(t)`, `NewTenantSchema(TenantSchemaConfig)` (returns nil for empty configs), `DefaultServiceConfig()`, `DefaultHNSWConfig()`
+- [x] `Options` struct: `DBPath` and `Embedder` required; optional `Clock`, `ServiceConfig` (`*ServiceConfig`), `TenantSchema`, `HNSW` (`*HNSWConfig`), `FlatScanThreshold`, `OpenTimeout`, `HNSWRandSeed`. Embedder dim drives storage dim — no separate `Dim` knob to mismatch
+- [x] `Open(Options) (Service, io.Closer, error)`: opens bbolt, wires the service, returns the storage handle as `io.Closer` so callers `defer closer.Close()`. Embedder lifecycle is the caller's
+- [x] No transports start — library mode is daemon-free. To run a transport, use `cmd/memmy` with a YAML config
+- [x] Pointer-typed tunable overrides eliminate the partial-zero footgun: `Options.ServiceConfig` and `Options.HNSW` are pointers (`nil` → defaults, non-nil → caller's complete config). Field-by-field merge would silently override intentional zero values for `RefractoryPeriod` / `LogDampening`. Doc comments tell callers to start from `DefaultServiceConfig()` / `DefaultHNSWConfig()`, mutate, then take the address
+- [x] `HNSWConfig` re-export is annotated as bbolt-specific so a future second backend triggers an explicit revisit
+
+### US-702 — Library tests ✅
+- [x] `memmy_test.go` (package `memmy_test`): 19 tests covering required-field validation (DBPath, Embedder, zero-dim), defaults applied, Write→Recall round-trip, Reinforce/Demote/Mark with refractory advancement, Stats reflects writes, Forget by MessageID, TenantSchema accept-valid + reject-invalid (three error codes via `errors.As(err, *ErrTenantInvalid)`), empty schema config returns nil, partial `ServiceConfig` and `HNSW` overrides via the pointer pattern, Close releases the bbolt file lock, Close is idempotent, and a custom user-supplied `Embedder` flowing through `Open`
+- [x] All tests use real bbolt in `t.TempDir()` plus a `FakeClock`, never mocks for storage
+
+### US-703 — Documentation ✅
+- [x] `README.md`: new "Use as a library" section with full quickstart (Gemini embedder, tenant schema, Open, Write, Recall) and notes on Embedder/TenantSchema/Close/transport semantics
+- [x] This file: Round 7
+
+### US-704 — Final regression ✅
+- [x] `go vet ./...` clean
+- [x] `go build ./...` clean
+- [x] `go test ./...` all green — **137 tests** across **14 packages** (the new top-level `memmy` package adds 19 tests; module count rises from 13 → 14)
+- [x] `go test -race ./...` all green
+- [x] No changes to `internal/`; the facade is purely additive

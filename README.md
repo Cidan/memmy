@@ -24,6 +24,67 @@ memmy also supports the **MCP stdio transport** for use as a child process under
 
 An optional **tenant schema** (`tenant:` block in the config) constrains the shape of the `tenant` field on every memory.* call. The schema is rendered into the MCP tool's `inputSchema` so the LLM sees the rules during tool listing, and invalid calls return a structured corrective error. See `memmy.example.yaml` for a worked example using `project` (absolute path) and `scope: "global"` (cross-project) keys, and DESIGN.md §3.1 for semantics. Without a schema, any string-keyed tuple is accepted (today's default).
 
+## Use as a library
+
+memmy ships a small facade at the module root for in-process embedding. The daemon (`cmd/memmy`) and the library use the same `MemoryService` underneath; the facade just skips the transport layer.
+
+```go
+import (
+    "context"
+
+    "github.com/Cidan/memmy"
+)
+
+func main() {
+    ctx := context.Background()
+
+    emb, err := memmy.NewGeminiEmbedder(ctx, memmy.GeminiEmbedderOptions{
+        APIKey: "...",
+        Model:  "gemini-embedding-2",
+        Dim:    3072,
+    })
+    if err != nil { /* ... */ }
+
+    schema, err := memmy.NewTenantSchema(memmy.TenantSchemaConfig{
+        Keys: map[string]memmy.TenantKeyConfig{
+            "user":  {Required: true, Pattern: `^[a-zA-Z0-9_.-]+$`},
+            "scope": {Enum: []string{"chat", "code"}},
+        },
+    })
+    if err != nil { /* ... */ }
+
+    svc, closer, err := memmy.Open(memmy.Options{
+        DBPath:       "/var/lib/myapp/memmy.db",
+        Embedder:     emb,
+        TenantSchema: schema,
+    })
+    if err != nil { /* ... */ }
+    defer closer.Close()
+
+    if _, err := svc.Write(ctx, memmy.WriteRequest{
+        Tenant:  map[string]string{"user": "alice", "scope": "chat"},
+        Message: "Antonio prefers terse PR titles.",
+    }); err != nil { /* ... */ }
+
+    res, err := svc.Recall(ctx, memmy.RecallRequest{
+        Tenant: map[string]string{"user": "alice", "scope": "chat"},
+        Query:  "what does antonio like in PRs",
+        K:      8,
+    })
+    _ = res
+}
+```
+
+Notes:
+
+- **`Embedder` is required and pluggable.** Use `memmy.NewFakeEmbedder(dim)` for tests or supply any type satisfying the `memmy.Embedder` interface.
+- **`TenantSchema` is optional.** Pass `nil` (or call `NewTenantSchema` with an empty `TenantSchemaConfig`) to accept any tuple shape.
+- **`closer.Close()` releases the bbolt file lock.** The embedder's lifecycle is the caller's; `Close` does not touch it.
+- **No transports start.** The facade is library-only — to expose `MemoryService` over MCP / HTTP, run `cmd/memmy` with a YAML config instead.
+- **Tunable overrides use a pointer.** `Options.ServiceConfig` and `Options.HNSW` are `*ServiceConfig` and `*HNSWConfig` respectively — `nil` means "use defaults," and any non-nil value is treated as a complete config. To change one knob, start from `memmy.DefaultServiceConfig()` (or `memmy.DefaultHNSWConfig()`), mutate, and pass the address. The facade does not field-merge because some service tunables (`RefractoryPeriod`, `LogDampening`) accept zero as an intentional disable signal.
+
+The full surface (request/result types, `EdgeKind`, `EmbedTask`, tunable `ServiceConfig`, HNSW config) is re-exported as type aliases on the `memmy` package; package internals stay under `internal/`.
+
 ## MCP tool surface
 
 Seven tools, all rooted at the configured `MemoryService`:
