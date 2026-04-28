@@ -35,6 +35,7 @@ These are restatements of the load-bearing principles in DESIGN.md §0. Do not d
 - **Vectors are L2-normalized at write time and stored as raw little-endian float32 bytes.** No gob, no base64. Backends with native vector types may use them; the contract (DESIGN.md §4.8) is unchanged.
 - **Do not add precomputed semantic-similarity *memory* edges** without discussing with the user — see DESIGN.md §7.4.
 - **The two-tier reinforcement (co-retrieval vs co-traversal) is intentional.** Don't collapse them.
+- **Implicit and explicit reinforcement share `Node.Weight` but use different paths.** `Recall` co-retrieval/co-traversal go through `applyNodeDecayReinforce` — always-on, not refractory-gated, not log-dampened. The caller-driven `Reinforce` / `Demote` / `Mark` ops go through `applyExplicitNodeBump` — refractory-gated and log-dampened. Don't merge the two helpers; the implicit path must remain unconditional. See DESIGN.md §8.2.
 - **`HNSWMeta` is never cached in memory.** Read fresh from the backend on every operation that needs it.
 
 ## Coding Conventions

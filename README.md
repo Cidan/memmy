@@ -24,6 +24,22 @@ memmy also supports the **MCP stdio transport** for use as a child process under
 
 An optional **tenant schema** (`tenant:` block in the config) constrains the shape of the `tenant` field on every memory.* call. The schema is rendered into the MCP tool's `inputSchema` so the LLM sees the rules during tool listing, and invalid calls return a structured corrective error. See `memmy.example.yaml` for a worked example using `project` (absolute path) and `scope: "global"` (cross-project) keys, and DESIGN.md §3.1 for semantics. Without a schema, any string-keyed tuple is accepted (today's default).
 
+## MCP tool surface
+
+Seven tools, all rooted at the configured `MemoryService`:
+
+| Tool                | When the LLM should call it                                                                                  |
+|---------------------|--------------------------------------------------------------------------------------------------------------|
+| `memory.write`      | Save a fact, decision, preference, or pattern worth remembering across conversations.                        |
+| `memory.recall`     | Retrieve relevant memories before answering. Every call reinforces what it surfaces (Hebbian co-retrieval).  |
+| `memory.reinforce`  | A specific recalled hit was actually useful in the answer.                                                   |
+| `memory.demote`     | A specific recalled hit was misleading or wrong. Soft-inhibits without deleting.                             |
+| `memory.mark`       | A stretch of recent context turned out to matter — retroactively boost the window.                           |
+| `memory.forget`     | Erase outright. Use only for corrected misinformation, secrets, or explicit user request.                    |
+| `memory.stats`      | Counts and average weights for one tenant or in aggregate.                                                   |
+
+Reinforce/Demote/Mark go through a per-node refractory window (default 60 s) so a stuck or over-eager caller can't double-count or saturate the corpus. Demote clamps at `node_floor` and never deletes — `forget` is the hard-delete path. See DESIGN.md §8.2 for the implicit-vs-explicit reinforcement split.
+
 ## Tests
 
 ```sh

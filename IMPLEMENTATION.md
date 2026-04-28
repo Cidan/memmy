@@ -209,6 +209,43 @@ Architect-flagged improvements applied without changing the architectural envelo
 - [x] `go test ./...` all green — **104 tests** across the **13** packages in `internal/` + `cmd/` (9 ship `*_test.go` files; the remaining 4 are interface-only or entrypoint packages with no tests of their own)
 - [x] `go test -race ./...` all green
 
+## Round 6 — Explicit reinforcement: Reinforce / Demote / Mark with refractory + log-dampening
+
+### US-601 — Service-layer Reinforce/Demote/Mark + refractory + log-dampening ✅
+- [x] `internal/types/types.go` adds `ReinforceRequest/Result`, `DemoteRequest/Result`, `MarkRequest/Result`
+- [x] `internal/service/service.go` Config gains `RefractoryPeriod` (default 60s), `LogDampening` (default true), `MarkMaxNodes` (default 256); `MemoryService` interface declares the three new ops
+- [x] `internal/service/decay.go` adds `applyExplicitNodeBump` — explicit path with refractory gate + log-dampening — alongside existing `applyNodeDecayReinforce` (implicit Recall path, unchanged)
+- [x] Refractory: when `now - LastTouched < RefractoryPeriod`, the closure drops the delta but still updates `LastTouched` and `AccessCount`. `skipped` is reset at the top of the closure so MVCC retries report the final invocation's outcome
+- [x] Log-dampening: positive deltas scale by `1 - decayed/WeightCap` (clamped ≥ 0); negative deltas (Demote) bypass dampening
+- [x] `internal/service/reinforce.go` (new) implements `Reinforce`, `Demote`, `Mark`. Mark walks `RecentNodeIDs`, applies recency-scaled `Strength * NodeDelta` per node through the same explicit-bump helper; clamps weight at `NodeFloor` for Demote
+
+### US-602 — MCP tool surface ✅
+- [x] `memory.reinforce`, `memory.demote`, `memory.mark` registered via the existing `registerToolWithTenantSchema` helper; tenant property rendered through any configured `TenantSchema`
+- [x] Each handler honours `tenantErrorResult` for structured corrective payloads
+- [x] Tool descriptions are LLM-facing — they describe WHEN to call and WHAT effect the user gains, with no mention of weight, decay, refractory, log-dampening, NodeDelta, or WeightCap
+
+### US-603 — Service-level tests ✅
+- [x] `internal/service/reinforce_test.go` (new): 10 tests covering Reinforce bump, refractory blocking + expiry, log-dampening near cap, log-dampening off matches NodeDelta, Demote clamp at NodeFloor, Mark window scoping, Mark refractory interaction, unknown-node error paths, Mark input validation
+- [x] All tests use real bbolt (`t.TempDir()`) + `clock.Fake` + fake embedder
+
+### US-604 — MCP integration tests ✅
+- [x] `TestMCP_ToolList` asserts the three new tools register
+- [x] Round-trip tests for `memory.reinforce`, `memory.demote`, `memory.mark` against an in-process MCP client over real bbolt
+- [x] `TestMCP_Reinforce_TenantValidationError` covers the schema-error surface
+
+### US-605 — DESIGN.md updates ✅
+- [x] §8.2 rewritten: documents implicit (Recall) vs explicit (caller-driven) reinforcement paths, refractory period, log-dampening formula, Demote semantics, Mark synaptic-tag-capture analog
+- [x] §9.1 `MemoryService` interface lists `Reinforce`, `Demote`, `Mark` with request/result shapes
+- [x] §10.2 MCP adapter table extends to seven tools
+- [x] §12 sample config block adds `refractory_period`, `log_dampening`, `mark_max_nodes`
+
+### US-606 — Final regression ✅
+- [x] `go vet ./...` clean
+- [x] `go build ./...` clean
+- [x] `go test ./...` all green — **118 tests** across **13 packages**
+- [x] `go test -race ./...` all green
+- [x] `memmy.example.yaml` updated with the three new memory.* keys + comments
+
 ## Round 4 — Optional tenant schema (single-server, MCP-rendered)
 
 ### US-301 — Friendly YAML tenant schema in config ✅

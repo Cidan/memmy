@@ -1095,7 +1095,7 @@ bbolt deployments are single-node by file-lock semantics; the application is the
 - **Cross-tenant search.** Out of scope for v1; would require an ACL model.
 - **Embedding model + task-strategy upgrades.** Strategy for rotating models OR task hints (e.g., switching from gemini-embedding-2's `RETRIEVAL_DOCUMENT` prefix to a future model's native parameter) without invalidating the entire index. Both shifts move stored vectors out of the latent space new queries embed into. Likely fix: namespace `vectors` and `hnsw_*` by `(model_name, version, task_strategy)` and migrate lazily on read.
 - **Multi-modal memory.** Schema can extend; embedder grows accordingly.
-- **Active forgetting.** Explicit "forget topic X" RPC.
+- **Topic-level active forgetting.** Per-node soft inhibition is shipped (`Demote`, §8.2). A future "forget topic X" RPC would resolve a query into a coherent topic cluster and demote the cluster as a unit; the Rac1-style cascade to co-activated neighbors (vestige's analog) is one possible mechanism worth evaluating against memmy's existing edge-decay dynamics, which already isolate demoted nodes naturally as their co-retrieval edges starve.
 - **HNSW deletion compaction.** Tombstones + filtered search work for v1. If churn is high, add a periodic compaction pass that hard-deletes and rebuilds affected neighbor lists.
 - **Lexical / sparse retrieval.** Reserved interface in §9. Add `LexicalIndex` (BM25 or sparse-vector) if dense retrieval underperforms on rare tokens, IDs, or proper nouns. Do not pre-build.
 - **Cold-start memory edges (`EdgeColdSemantic`).** If usage-only edges leave early UX too thin (§7.4).
@@ -1114,6 +1114,11 @@ bbolt deployments are single-node by file-lock semantics; the application is the
 - **Seed** — node returned by `VectorIndex.Search` post-rerank; entry point for memory-graph expansion.
 - **Hebbian co-retrieval** — strengthening a memory edge between two nodes that appeared together in a top-K seed set.
 - **Co-traversal** — strengthening a memory edge that delivered a node into the final returned result set.
+- **Implicit reinforcement** — the always-on `+NodeDelta` bump applied to every retrieved node by `Recall`. Not refractory-gated, not log-dampened.
+- **Explicit reinforcement** — the caller-driven `Reinforce` / `Demote` / `Mark` operations. Same `Node.Weight` axis as implicit, but routed through a refractory + log-dampened helper.
+- **Refractory period** — per-node window (default 60 s) within which a second explicit bump is dropped. Prevents double-counting when an implicit Recall bump and an explicit Reinforce land on the same node within one conversational round-trip.
+- **Log-dampened reinforcement** — positive explicit deltas scale by `1 - decayed_weight / WeightCap`, so saturation is asymptotic instead of a hard wall. Demote bypasses dampening.
+- **Mark / synaptic-tag capture** — `Mark(tenant, since, strength)` retroactively boosts every node whose `CreatedAt ≥ since`, with linear recency scaling. The biological analog is Frey & Morris 1997: a strong late event captures plasticity-related proteins at synapses tagged earlier in a window of hours.
 - **Lazy decay** — computing exponential decay on read inside the same transaction as reinforcement. No sweeper.
 - **HNSW** — Hierarchical Navigable Small World; the disk-resident ANN index over the `vectors` collection. Layered graph, navigation by greedy descent + ef-search.
 - **Oversample** — pulling top-N candidates with N ≫ K so weight-aware reranking has room to lift hot-but-moderately-similar memories.
