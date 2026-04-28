@@ -12,9 +12,6 @@ import (
 	"github.com/Cidan/memmy/internal/types"
 )
 
-// embedTaskRetrievalQuery is a small alias to keep the import surface
-// of recall.go tight and the call site readable.
-const embedTaskRetrievalQuery = embed.EmbedTaskRetrievalQuery
 
 // Recall implements the full retrieval pipeline (DESIGN.md §6).
 //
@@ -59,16 +56,16 @@ func (s *Service) Recall(ctx context.Context, req types.RecallRequest) (types.Re
 	// Queries get RetrievalQuery so the model tunes the vector for the
 	// "search input" side of the asymmetric pair (writes use
 	// RetrievalDocument — see write.go).
-	embed, err := s.embedder.Embed(ctx, embedTaskRetrievalQuery, []string{req.Query})
+	qVec, err := s.embedder.Embed(ctx, embed.EmbedTaskRetrievalQuery, []string{req.Query})
 	if err != nil {
 		return types.RecallResult{}, err
 	}
-	if len(embed) == 0 {
+	if len(qVec) == 0 {
 		return types.RecallResult{}, errors.New("service: embedder returned 0 vectors")
 	}
 
 	// Phase 2 — vector search.
-	hits, err := s.vidx.Search(ctx, tenant, embed[0], overN)
+	hits, err := s.vidx.Search(ctx, tenant, qVec[0], overN)
 	if err != nil {
 		return types.RecallResult{}, err
 	}

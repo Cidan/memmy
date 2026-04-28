@@ -206,7 +206,7 @@ Architect-flagged improvements applied without changing the architectural envelo
 ### US-406 — Final regression ✅
 - [x] `go vet ./...` clean
 - [x] `go build ./...` clean
-- [x] `go test ./...` all green (104 tests across 13 packages)
+- [x] `go test ./...` all green — **104 tests** across the **13** packages in `internal/` + `cmd/` (9 ship `*_test.go` files; the remaining 4 are interface-only or entrypoint packages with no tests of their own)
 - [x] `go test -race ./...` all green
 
 ## Round 4 — Optional tenant schema (single-server, MCP-rendered)

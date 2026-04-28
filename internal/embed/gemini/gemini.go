@@ -79,6 +79,12 @@ func (e *Embedder) Embed(ctx context.Context, task embed.EmbedTask, texts []stri
 		return nil, nil
 	}
 	contents := make([]*genai.Content, len(texts))
+	// OutputDimensionality is documented as supported on
+	// gemini-embedding-001 and gemini-embedding-2 (Matryoshka:
+	// 3072 native, truncatable to 1536/768). Some models may ignore
+	// it; the post-call dim mismatch check below is the safety net
+	// that surfaces a clean error rather than silently writing
+	// wrong-shape vectors into bbolt.
 	cfg := &genai.EmbedContentConfig{
 		OutputDimensionality: int32Ptr(int32(e.dim)),
 	}
