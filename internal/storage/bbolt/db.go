@@ -7,6 +7,9 @@ package bboltstore
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"go.etcd.io/bbolt"
@@ -99,9 +102,17 @@ func Open(opts Options) (*Storage, error) {
 		bopts.Timeout = opts.Timeout
 	}
 
-	db, err := bbolt.Open(opts.Path, 0o600, &bopts)
+	resolvedPath, err := resolvePath(opts.Path)
 	if err != nil {
-		return nil, fmt.Errorf("bbolt open %q: %w", opts.Path, err)
+		return nil, fmt.Errorf("bbolt resolve %q: %w", opts.Path, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(resolvedPath), 0o700); err != nil {
+		return nil, fmt.Errorf("bbolt mkdir for %q: %w", resolvedPath, err)
+	}
+
+	db, err := bbolt.Open(resolvedPath, 0o600, &bopts)
+	if err != nil {
+		return nil, fmt.Errorf("bbolt open %q: %w", resolvedPath, err)
 	}
 	if err := db.Update(initRoots); err != nil {
 		_ = db.Close()
@@ -131,6 +142,28 @@ func (s *Storage) Dim() int { return s.dim }
 
 // FlatScanThreshold returns the configured threshold.
 func (s *Storage) FlatScanThreshold() int { return s.flatScanThreshold }
+
+// resolvePath expands a leading `~/` to the current user's home
+// directory. bbolt.Open does not do this expansion itself (Go's
+// stdlib leaves tildes to the shell), so configs using `~/foo` would
+// otherwise be passed literally and fail with "no such file or
+// directory".
+//
+// We deliberately handle ONLY the leading `~/` form. `~user/...` is
+// shell-specific and not worth supporting here.
+func resolvePath(p string) (string, error) {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("expand ~: %w", err)
+		}
+		if p == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, p[2:]), nil
+	}
+	return p, nil
+}
 
 func initRoots(tx *bbolt.Tx) error {
 	for _, name := range []string{bktTenants, bktT, bktMeta} {
