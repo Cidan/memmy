@@ -159,8 +159,14 @@ func TestTenantSchemaConfig_EmptyAccepted(t *testing.T) {
 	if cfg.Tenant.IsConfigured() {
 		t.Fatal("default config should have an unconfigured tenant schema")
 	}
+	// Default() ships with NO transports enabled — the operator must
+	// declare one explicitly. Add a stdio transport here so the rest
+	// of Validate() can run.
+	cfg.Server.Transports = map[string]config.TransportConfig{
+		config.TransportStdio: {Enabled: true},
+	}
 	if err := cfg.Validate(); err != nil {
-		t.Fatalf("default should validate: %v", err)
+		t.Fatalf("default + stdio should validate: %v", err)
 	}
 }
 
@@ -168,6 +174,10 @@ func TestTenantSchemaConfig_ValidParse(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "memmy.yaml")
 	contents := `
+server:
+  transports:
+    stdio:
+      enabled: true
 storage:
   backend: bbolt
   bbolt:
@@ -245,6 +255,44 @@ func TestTenantSchemaConfig_RejectsEmptyOneOfSet(t *testing.T) {
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for empty one_of set")
+	}
+}
+
+// TestConfig_NoTransportsByDefault asserts that Default() ships with
+// zero transports enabled — operators must explicitly declare one,
+// and a YAML config that omits server.transports fails validation
+// rather than silently bringing up an unwanted listener.
+func TestConfig_NoTransportsByDefault(t *testing.T) {
+	cfg := config.Default()
+	if len(cfg.Server.Transports) != 0 {
+		t.Fatalf("Default() should have empty transports; got %v", cfg.Server.Transports)
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Default() should fail Validate (no transport enabled)")
+	}
+}
+
+// TestConfig_LoadOmittedServerSectionFails covers the original user
+// concern: a YAML without server.transports should NOT silently bring
+// up an mcp listener.
+func TestConfig_LoadOmittedServerSectionFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memmy.yaml")
+	contents := `
+storage:
+  backend: bbolt
+  bbolt:
+    path: "/tmp/memmy.db"
+embedder:
+  backend: fake
+  fake:
+    dim: 32
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("Load() should reject a config that omits server.transports")
 	}
 }
 

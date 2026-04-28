@@ -143,12 +143,16 @@ type PruneConfig struct {
 }
 
 // Default returns a Config populated with the documented defaults.
+//
+// No transport is enabled by default — the operator must explicitly
+// declare which one(s) to run via server.transports. An empty
+// transports map fails Validate() so config typos can't accidentally
+// bring up an unwanted listener (or, in the case of stdio, take over
+// the parent's stdin/stdout silently).
 func Default() Config {
 	return Config{
 		Server: ServerConfig{
-			Transports: map[string]TransportConfig{
-				"mcp": {Enabled: true, Addr: "0.0.0.0:8765"},
-			},
+			Transports: map[string]TransportConfig{},
 		},
 		Storage: StorageConfig{
 			Backend: "bbolt",
