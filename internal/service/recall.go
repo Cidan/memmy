@@ -27,9 +27,9 @@ func (s *Service) Recall(ctx context.Context, req types.RecallRequest) (types.Re
 	if strings.TrimSpace(req.Query) == "" {
 		return types.RecallResult{}, errors.New("service: query required")
 	}
-	tenant := types.TenantID(req.Tenant)
-	if tenant == "" {
-		return types.RecallResult{}, errors.New("service: tenant required")
+	tenant, err := s.requireValidTenant(req.Tenant)
+	if err != nil {
+		return types.RecallResult{}, err
 	}
 	k := req.K
 	if k <= 0 {

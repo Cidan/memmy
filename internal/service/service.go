@@ -39,6 +39,7 @@ type Service struct {
 	clock    clock.Clock
 	cfg      Config
 	entropy  *ulid.MonotonicEntropy
+	schema   *TenantSchema // nil → accept any tuple
 }
 
 // Config bundles the tunables for chunking, retrieval, decay, and
@@ -111,8 +112,9 @@ func DefaultConfig() Config {
 	}
 }
 
-// New constructs a Service. All four ports are required.
-func New(g graph.Graph, v vectorindex.VectorIndex, e embed.Embedder, c clock.Clock, cfg Config) (*Service, error) {
+// New constructs a Service. All four ports are required. The schema
+// is optional — pass nil to accept any tenant tuple (today's behavior).
+func New(g graph.Graph, v vectorindex.VectorIndex, e embed.Embedder, c clock.Clock, cfg Config, schema *TenantSchema) (*Service, error) {
 	if g == nil || v == nil || e == nil {
 		return nil, errors.New("service: graph, vectorindex, and embedder are required")
 	}
@@ -129,8 +131,14 @@ func New(g graph.Graph, v vectorindex.VectorIndex, e embed.Embedder, c clock.Clo
 		clock:    c,
 		cfg:      cfg,
 		entropy:  ulid.Monotonic(rand.Reader, 0),
+		schema:   schema,
 	}, nil
 }
+
+// Schema returns the active TenantSchema, or nil if none is configured.
+// Used by transport adapters to render the schema into wire-level
+// input schemas and to surface corrective errors back to clients.
+func (s *Service) Schema() *TenantSchema { return s.schema }
 
 // newID generates a ULID using the service's clock for the time bits and
 // a process-monotonic entropy source for the random bits. ULIDs are
@@ -147,11 +155,15 @@ func (s *Service) newID() string {
 	return id.String()
 }
 
-// resolveTenant normalizes a tuple to a TenantID and ensures the tenant
-// is registered. Returns the canonical TenantID.
+// resolveTenant validates the tuple against the configured schema (if
+// any), normalizes it to a TenantID, and ensures the tenant is
+// registered. Returns the canonical TenantID.
 func (s *Service) resolveTenant(ctx context.Context, tuple map[string]string) (string, error) {
 	if len(tuple) == 0 {
 		return "", errors.New("service: tenant tuple is empty")
+	}
+	if err := s.schema.Validate(tuple); err != nil {
+		return "", err
 	}
 	id := types.TenantID(tuple)
 	// Idempotent upsert; cheap.
@@ -161,6 +173,19 @@ func (s *Service) resolveTenant(ctx context.Context, tuple map[string]string) (s
 		CreatedAt: s.clock.Now(),
 	})
 	return id, err
+}
+
+// requireValidTenant validates the tuple for read-only paths (Recall,
+// Forget, Stats) that don't auto-register tenants. Returns the
+// TenantID on success.
+func (s *Service) requireValidTenant(tuple map[string]string) (string, error) {
+	if len(tuple) == 0 {
+		return "", errors.New("service: tenant tuple is empty")
+	}
+	if err := s.schema.Validate(tuple); err != nil {
+		return "", err
+	}
+	return types.TenantID(tuple), nil
 }
 
 // Compile-time interface conformance check.

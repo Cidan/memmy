@@ -72,3 +72,36 @@ memory:
     node_floor: 0.01
 
   weight_cap: 100.0
+
+# Optional tenant-tuple schema. When set, every memory.* call's `tenant`
+# field is validated against this shape: the schema is rendered into
+# the MCP tool InputSchema (so the LLM sees the constraints when
+# listing tools), and invalid calls return a structured corrective
+# error so the LLM can self-correct on retry.
+#
+# When this section is absent or empty, memmy accepts any string-keyed
+# tenant tuple — today's default behavior.
+#
+# IMPORTANT: changing the schema does NOT migrate stored memories.
+# TenantID is derived from the (validated) tuple, so data written
+# under one schema remains addressable as soon as the schema is
+# changed back to one that accepts the original tuple shape. Memories
+# don't get rewritten or lost when the schema rolls.
+tenant:
+  description: |
+    Identity for this memory. Use `project` (absolute path of the
+    working directory) for memories about a specific codebase.
+    Use `scope: "global"` for cross-project knowledge — preferences,
+    recurring patterns, things that survive any single repo.
+  keys:
+    project:
+      description: "Absolute path of the working directory."
+      pattern: "^/"
+    scope:
+      description: "Memory scope; 'global' for cross-project."
+      enum: ["global"]
+  # Exactly one of these key sets must be present in every tenant
+  # tuple. Sending both project and scope, or neither, is rejected.
+  one_of:
+    - [project]
+    - [scope]

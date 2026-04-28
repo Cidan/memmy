@@ -152,6 +152,102 @@ func TestConfig_StdioRequiresNoAddr(t *testing.T) {
 	}
 }
 
+// Tenant-schema config tests (Round 4 / US-301).
+
+func TestTenantSchemaConfig_EmptyAccepted(t *testing.T) {
+	cfg := config.Default()
+	if cfg.Tenant.IsConfigured() {
+		t.Fatal("default config should have an unconfigured tenant schema")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default should validate: %v", err)
+	}
+}
+
+func TestTenantSchemaConfig_ValidParse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memmy.yaml")
+	contents := `
+storage:
+  backend: bbolt
+  bbolt:
+    path: "/tmp/memmy.db"
+embedder:
+  backend: fake
+  fake:
+    dim: 32
+tenant:
+  description: "Identity for this memory."
+  keys:
+    project:
+      description: "Absolute path."
+      pattern: "^/"
+    scope:
+      description: "global for cross-project"
+      enum: ["global"]
+  one_of:
+    - [project]
+    - [scope]
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Tenant.IsConfigured() {
+		t.Fatal("expected tenant configured")
+	}
+	if cfg.Tenant.Keys["project"].Pattern != "^/" {
+		t.Errorf("project.pattern=%q", cfg.Tenant.Keys["project"].Pattern)
+	}
+	if got := cfg.Tenant.Keys["scope"].Enum; len(got) != 1 || got[0] != "global" {
+		t.Errorf("scope.enum=%v", got)
+	}
+	if len(cfg.Tenant.OneOf) != 2 {
+		t.Errorf("one_of len=%d, want 2", len(cfg.Tenant.OneOf))
+	}
+}
+
+func TestTenantSchemaConfig_RejectsInvalidPattern(t *testing.T) {
+	cfg := config.Default()
+	cfg.Tenant = config.TenantSchemaConfig{
+		Keys: map[string]config.TenantKeyConfig{
+			"project": {Pattern: "([invalid"},
+		},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for invalid regex pattern")
+	}
+}
+
+func TestTenantSchemaConfig_RejectsUnknownOneOfKey(t *testing.T) {
+	cfg := config.Default()
+	cfg.Tenant = config.TenantSchemaConfig{
+		Keys: map[string]config.TenantKeyConfig{
+			"project": {},
+		},
+		OneOf: [][]string{{"project"}, {"missing"}},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for unknown one_of key")
+	}
+}
+
+func TestTenantSchemaConfig_RejectsEmptyOneOfSet(t *testing.T) {
+	cfg := config.Default()
+	cfg.Tenant = config.TenantSchemaConfig{
+		Keys: map[string]config.TenantKeyConfig{
+			"project": {},
+		},
+		OneOf: [][]string{{}, {"project"}},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for empty one_of set")
+	}
+}
+
 func TestConfig_HTTPRequiresAddr(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.Transports = map[string]config.TransportConfig{

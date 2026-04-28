@@ -14,9 +14,9 @@ import (
 // HNSW records/edges) by ID, or all messages created strictly before a
 // given timestamp.
 func (s *Service) Forget(ctx context.Context, req types.ForgetRequest) (types.ForgetResult, error) {
-	tenant := types.TenantID(req.Tenant)
-	if tenant == "" {
-		return types.ForgetResult{}, errors.New("service: tenant required")
+	tenant, err := s.requireValidTenant(req.Tenant)
+	if err != nil {
+		return types.ForgetResult{}, err
 	}
 	if strings.TrimSpace(req.MessageID) == "" && req.Before.IsZero() {
 		return types.ForgetResult{}, errors.New("service: forget requires MessageID or Before")

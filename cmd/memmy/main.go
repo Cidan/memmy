@@ -69,12 +69,18 @@ func run() error {
 		return fmt.Errorf("embedder dim (%d) does not match storage dim (%d)", cfg.EmbedderDim(), storage.Dim())
 	}
 
+	tenantSchema, err := service.NewTenantSchemaFromConfig(cfg.Tenant)
+	if err != nil {
+		return fmt.Errorf("build tenant schema: %w", err)
+	}
+
 	svc, err := service.New(
 		storage.Graph(),
 		storage.VectorIndex(),
 		embedder,
 		clock.Real{},
 		serviceConfigFromYAML(cfg),
+		tenantSchema,
 	)
 	if err != nil {
 		return fmt.Errorf("build service: %w", err)
@@ -86,7 +92,7 @@ func run() error {
 	// blocks until ctx is cancelled (signal) or stdin closes.
 	if t, ok := cfg.Server.Transports[config.TransportStdio]; ok && t.Enabled {
 		logger.Info("memmy starting (stdio transport)")
-		adapter := mcpadapter.New(svc)
+		adapter := mcpadapter.New(svc, tenantSchema)
 		err := adapter.RunStdio(ctx)
 		logger.Info("memmy stopped")
 		// EOF on stdin is the normal "host is done" signal in stdio
@@ -110,7 +116,7 @@ func run() error {
 		switch name {
 		case config.TransportMCP:
 			supervisor.Add(&mcpService{
-				adapter: mcpadapter.New(svc),
+				adapter: mcpadapter.New(svc, tenantSchema),
 				addr:    t.Addr,
 				log:     logger,
 			})

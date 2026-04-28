@@ -117,6 +117,22 @@ Internally the tuple is normalized (keys sorted, values trimmed) into a canonica
 
 The original tuple is also persisted alongside its `TenantID` in the `tenants` collection, so we can list known tenants for stats and admin. This registry is read fresh from the backend on demand — no in-memory tenant cache.
 
+### 3.1 Optional tenant schema
+
+By default any string-keyed tuple is accepted; whichever shape the caller sends defines a tenant. For deployments that want to constrain tenant shape (e.g., a Claude Code MCP server that wants every memory tagged with either `project=<abs path>` or `scope=global`), the config exposes an optional **tenant schema**:
+
+- `tenant.description` — human prose, rendered into the MCP tool descriptions and the `tenant` property's JSON Schema description so the LLM sees it during tool listing.
+- `tenant.keys` — declared keys with optional `description`, `pattern` (regex), `enum`, and `required` flags. All values are strings (the tuple is `map[string]string`). When a schema is configured, **unknown keys are rejected** (`additionalProperties: false`).
+- `tenant.one_of` — list of key-sets; **exactly one** of the listed sets must be fully present in every tuple (JSON Schema `oneOf` semantics).
+
+**Validation is shape-only and stateless.** The schema is evaluated against the incoming tuple before `TenantID` derivation; the tuple itself is not transformed. This means changing the schema does NOT migrate any stored memory — `TenantID` is purely a hash of the (validated) tuple, so:
+
+- Memories written under schema A remain addressable under schema A.
+- If schema A is replaced with schema B that rejects the same tuple, those memories become **unreachable** (no read can produce a tuple that hashes to their `TenantID`).
+- If schema B is rolled back to schema A (or any schema that accepts the original tuple shape), those memories are reachable again.
+
+There is no migration step, no forget-on-mismatch, no stored-tenant rewrites. The schema is a per-request validator that doubles as discoverable input documentation for MCP clients (see §10.2). Errors carry an `error_code`, `field`, `got` value, and the rendered JSON Schema as `expected_schema` so callers can self-correct.
+
 ---
 
 ## 4. Data Model
@@ -782,6 +798,8 @@ Tools registered (identical schema across both transports):
 
 The streamable transport allows long retrievals to yield partial results progressively (seeds first, then expanded set). Optional in v1; can return unary initially without an API break since results are already shaped as a list.
 
+When the optional **tenant schema** (§3.1) is configured, each tool's auto-derived `inputSchema` has its `tenant` property replaced with the schema-rendered JSON Schema, including the schema's `description`, per-key descriptions, patterns, enums, `additionalProperties: false`, and `oneOf` constraints. The MCP SDK validates incoming arguments against this schema before dispatching to the handler. As a defense-in-depth fallback, handlers also catch `*service.ErrTenantInvalid` and return a `CallToolResult{IsError: true}` whose `TextContent` carries a structured payload (`error_code`, `field`, `got`, `message`, `expected_schema`) so the LLM can retry with corrected input.
+
 ### 10.3 gRPC Adapter (future, reserved)
 
 Lives in `internal/transport/grpc/`. Service definitions in protobuf; service stubs implement `MemoryService` with proto ↔ Go-type marshalling. Designed to run on a separate listener alongside the MCP adapter. Authentication and authorization layers mount here.
@@ -896,6 +914,22 @@ memory:
     node_floor: 0.01
 
   weight_cap: 100.0
+
+# Optional tenant schema (§3.1). When unset, any tuple is accepted.
+tenant:
+  description: |
+    Identity for this memory. Use `project` (absolute path) for
+    project-scoped memories. Use `scope: "global"` for cross-project.
+  keys:
+    project:
+      description: "Absolute path of the working directory."
+      pattern: "^/"
+    scope:
+      description: "Memory scope; 'global' for cross-project."
+      enum: ["global"]
+  one_of:
+    - [project]
+    - [scope]
 ```
 
 ---

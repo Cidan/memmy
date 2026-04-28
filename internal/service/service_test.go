@@ -43,7 +43,7 @@ func newFixture(t *testing.T, dim int, opts ...func(*service.Config)) *fixture {
 	for _, fn := range opts {
 		fn(&cfg)
 	}
-	svc, err := service.New(store.Graph(), store.VectorIndex(), emb, cl, cfg)
+	svc, err := service.New(store.Graph(), store.VectorIndex(), emb, cl, cfg, nil)
 	if err != nil {
 		t.Fatalf("service.New: %v", err)
 	}

@@ -172,3 +172,40 @@ Architect-flagged improvements applied without changing the architectural envelo
 - [x] `go build ./...` clean
 - [x] `go test ./...` all green
 - [x] `go test -race ./...` all green
+
+## Round 4 — Optional tenant schema (single-server, MCP-rendered)
+
+### US-301 — Friendly YAML tenant schema in config ✅
+- [x] `internal/config` exposes a `tenant` section: top-level description, keys map (description / pattern / enum / required), optional `one_of` constraint
+- [x] Empty tenant section preserves today's free-form behavior
+- [x] `Config.Validate` compiles regex patterns at load time and rejects unknown `one_of` references / empty `one_of` sets
+- [x] +4 config tests covering empty-section, valid-parse, invalid-regex, unknown-one_of-key, empty-one_of-set
+
+### US-302 — Service-layer tenant validation + JSON Schema renderer ✅
+- [x] `service.TenantSchema` with `Validate(map[string]string) error` and `JSONSchema() *jsonschema.Schema`
+- [x] Validate enforces: unknown-key rejection, pattern, enum, required, `one_of` (exactly-one semantics)
+- [x] Errors are typed `*service.ErrTenantInvalid` with `Code`, `Field`, `Got`, `Message`, and a `Payload(expected)` method that emits a JSON envelope with `error_code` / `field` / `got` / `message` / `expected_schema`
+- [x] `Service.New` accepts an optional schema; nil = accept any tuple (unchanged path)
+- [x] `Service.Write/Recall/Forget/Stats` validate tenant before deriving `TenantID`
+- [x] No stored-tenant migration: `TenantID` is purely a hash of the validated tuple, so changing the schema and changing back leaves prior memories addressable
+- [x] +11 unit tests in tenant_schema_test.go covering every validation rule, JSON schema shape, and payload round-trip
+
+### US-303 — MCP adapter renders schema into the tool surface ✅
+- [x] `mcpadapter.New` takes an optional `*service.TenantSchema`; when set, every tool's auto-derived InputSchema has its `tenant` property replaced with the rendered JSON Schema
+- [x] Helper `registerToolWithTenantSchema` patches the tenant property uniformly across all four tools
+- [x] Each handler catches `*service.ErrTenantInvalid` and returns `CallToolResult{IsError: true}` carrying the structured payload (defense in depth — the SDK pre-validates against InputSchema, so this fires only for cases the schema doesn't fully express)
+- [x] +5 MCP integration tests: valid project tuple accepted; valid scope tuple accepted; invalid pattern surfaces an error (SDK or handler path); unknown tenant key rejected; schema description visible in InputSchema's tool listing
+
+### US-304 — Documentation + sample yaml ✅
+- [x] `memmy.example.yaml` shows the `tenant:` section using ONLY `project` (`pattern: ^/`) and `scope` (`enum: [global]`), with `one_of: [[project], [scope]]`
+- [x] DESIGN.md §3.1 added: schema semantics, no-migration guarantee, error envelope shape
+- [x] DESIGN.md §10.2 notes that the MCP adapter renders the schema into each tool's InputSchema and produces structured corrective errors
+- [x] DESIGN.md §12 sample includes the tenant block
+- [x] `README.md` mentions the schema feature with a pointer to the example
+- [x] This file: Round 4 documented
+
+### US-305 — Final regression ✅
+- [x] `go vet ./...` clean
+- [x] `go build ./...` clean
+- [x] `go test ./...` all green (**94 tests across 13 packages**)
+- [x] `go test -race ./...` all green

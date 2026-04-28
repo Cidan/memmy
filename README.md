@@ -22,6 +22,8 @@ The default configuration enables the streamable MCP HTTP transport on port 8765
 
 memmy also supports the **MCP stdio transport** for use as a child process under an MCP-aware host (editor or agent runtime). Set `server.transports.stdio.enabled: true` and disable every other transport — stdio is mutually exclusive with HTTP listeners because it owns the process's stdin/stdout. Logs always go to stderr.
 
+An optional **tenant schema** (`tenant:` block in the config) constrains the shape of the `tenant` field on every memory.* call. The schema is rendered into the MCP tool's `inputSchema` so the LLM sees the rules during tool listing, and invalid calls return a structured corrective error. See `memmy.example.yaml` for a worked example using `project` (absolute path) and `scope: "global"` (cross-project) keys, and DESIGN.md §3.1 for semantics. Without a schema, any string-keyed tuple is accepted (today's default).
+
 ## Tests
 
 ```sh

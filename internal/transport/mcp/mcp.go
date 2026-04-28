@@ -7,10 +7,12 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/Cidan/memmy/internal/service"
@@ -26,19 +28,28 @@ const (
 // Adapter wraps a MemoryService and exposes it as an MCP Server with the
 // four memory.* tools.
 type Adapter struct {
-	svc service.MemoryService
-	srv *mcpsdk.Server
+	svc          service.MemoryService
+	srv          *mcpsdk.Server
+	tenantSchema *service.TenantSchema // nil when no schema is configured
 }
 
 // New constructs a new Adapter. Tool registration happens here so
 // subsequent calls to Server() return a fully-wired MCP server.
-func New(svc service.MemoryService) *Adapter {
+//
+// When tenantSchema is non-nil, every tool's InputSchema has its
+// `tenant` property replaced with the schema-rendered JSON Schema —
+// the LLM sees the constraints directly in the tool listing, and the
+// SDK validates incoming arguments against them. Handlers also
+// surface ErrTenantInvalid as a structured CallToolResult error so
+// the LLM has actionable retry information.
+func New(svc service.MemoryService, tenantSchema *service.TenantSchema) *Adapter {
 	a := &Adapter{
 		svc: svc,
 		srv: mcpsdk.NewServer(&mcpsdk.Implementation{
 			Name:    ServerName,
 			Version: ServerVersion,
 		}, nil),
+		tenantSchema: tenantSchema,
 	}
 	a.registerTools()
 	return a
@@ -154,25 +165,88 @@ type statsResult struct {
 // ----- registration -----
 
 func (a *Adapter) registerTools() {
-	mcpsdk.AddTool(a.srv, &mcpsdk.Tool{
+	registerToolWithTenantSchema(a.srv, a.tenantSchema, &mcpsdk.Tool{
 		Name:        "memory.write",
 		Description: "Ingest a message into memory. Splits into chunks, embeds, persists nodes/vectors/HNSW links and structural memory edges.",
-	}, a.handleWrite)
+	}, writeArgs{}, a.handleWrite)
 
-	mcpsdk.AddTool(a.srv, &mcpsdk.Tool{
+	registerToolWithTenantSchema(a.srv, a.tenantSchema, &mcpsdk.Tool{
 		Name:        "memory.recall",
 		Description: "Retrieve memories by semantic similarity with weight-aware re-ranking and graph expansion. Returns ranked results with provenance.",
-	}, a.handleRecall)
+	}, recallArgs{}, a.handleRecall)
 
-	mcpsdk.AddTool(a.srv, &mcpsdk.Tool{
+	registerToolWithTenantSchema(a.srv, a.tenantSchema, &mcpsdk.Tool{
 		Name:        "memory.forget",
 		Description: "Hard-delete a message and all derived nodes/vectors/edges, or all messages older than a timestamp.",
-	}, a.handleForget)
+	}, forgetArgs{}, a.handleForget)
 
-	mcpsdk.AddTool(a.srv, &mcpsdk.Tool{
+	registerToolWithTenantSchema(a.srv, a.tenantSchema, &mcpsdk.Tool{
 		Name:        "memory.stats",
 		Description: "Return per-tenant or aggregate memory counts and weight statistics.",
-	}, a.handleStats)
+	}, statsArgs{}, a.handleStats)
+}
+
+// registerToolWithTenantSchema is a small wrapper around mcp.AddTool
+// that auto-derives the InputSchema from the typed argument value and,
+// if a TenantSchema is configured, replaces the `tenant` property's
+// schema with the rendered one.
+//
+// We can't use generics here trivially because Go's type inference
+// won't carry the In type through both jsonschema.For[In] and the
+// handler signature without an explicit type parameter; the helper
+// is generic across both.
+func registerToolWithTenantSchema[In, Out any](
+	srv *mcpsdk.Server,
+	schema *service.TenantSchema,
+	tool *mcpsdk.Tool,
+	_ In,
+	handler func(context.Context, *mcpsdk.CallToolRequest, In) (*mcpsdk.CallToolResult, Out, error),
+) {
+	in, err := jsonschema.For[In](nil)
+	if err != nil {
+		// Fall back to SDK auto-derivation if reflection fails — this
+		// is an internal programming error rather than a runtime one.
+		mcpsdk.AddTool(srv, tool, handler)
+		return
+	}
+	if schema != nil && in.Properties != nil {
+		if _, ok := in.Properties["tenant"]; ok {
+			in.Properties["tenant"] = schema.JSONSchema()
+		}
+	}
+	tool.InputSchema = in
+	mcpsdk.AddTool(srv, tool, handler)
+}
+
+// tenantErrorResult inspects err and, if it's an *ErrTenantInvalid,
+// returns a CallToolResult{IsError: true} with a structured corrective
+// payload (error_code, field, got, message, expected_schema) so the
+// LLM can self-correct on retry. Returns nil for non-tenant errors.
+func (a *Adapter) tenantErrorResult(err error) *mcpsdk.CallToolResult {
+	var te *service.ErrTenantInvalid
+	if !errors.As(err, &te) {
+		return nil
+	}
+	var expected *jsonschema.Schema
+	if a.tenantSchema != nil {
+		expected = a.tenantSchema.JSONSchema()
+	}
+	payload, perr := te.Payload(expected)
+	if perr != nil {
+		// Fall back to plain message if marshalling somehow fails.
+		payload = []byte(`{"error_code":"tenant_invalid","message":` + jsonString(te.Message) + `}`)
+	}
+	return &mcpsdk.CallToolResult{
+		IsError: true,
+		Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: string(payload)}},
+	}
+}
+
+// jsonString trivially escapes a string into a quoted JSON string for
+// fallback error formatting.
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 // ----- handlers -----
@@ -187,6 +261,9 @@ func (a *Adapter) handleWrite(ctx context.Context, _ *mcpsdk.CallToolRequest, ar
 		Metadata: args.Metadata,
 	})
 	if err != nil {
+		if r := a.tenantErrorResult(err); r != nil {
+			return r, writeResult{}, nil
+		}
 		return nil, writeResult{}, err
 	}
 	return summary(out), writeResult{MessageID: out.MessageID, NodeIDs: out.NodeIDs}, nil
@@ -204,6 +281,9 @@ func (a *Adapter) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, a
 		OversampleN: args.Oversample,
 	})
 	if err != nil {
+		if r := a.tenantErrorResult(err); r != nil {
+			return r, recallResult{}, nil
+		}
 		return nil, recallResult{}, err
 	}
 	hits := make([]recallHit, len(out.Results))
@@ -237,6 +317,9 @@ func (a *Adapter) handleForget(ctx context.Context, _ *mcpsdk.CallToolRequest, a
 	}
 	out, err := a.svc.Forget(ctx, req)
 	if err != nil {
+		if r := a.tenantErrorResult(err); r != nil {
+			return r, forgetResult{}, nil
+		}
 		return nil, forgetResult{}, err
 	}
 	return summary(out), forgetResult{
@@ -249,6 +332,9 @@ func (a *Adapter) handleForget(ctx context.Context, _ *mcpsdk.CallToolRequest, a
 func (a *Adapter) handleStats(ctx context.Context, _ *mcpsdk.CallToolRequest, args statsArgs) (*mcpsdk.CallToolResult, statsResult, error) {
 	out, err := a.svc.Stats(ctx, types.StatsRequest{Tenant: args.Tenant})
 	if err != nil {
+		if r := a.tenantErrorResult(err); r != nil {
+			return r, statsResult{}, nil
+		}
 		return nil, statsResult{}, err
 	}
 	return summary(out), statsResult{

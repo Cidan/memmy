@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
 	"sort"
 	"time"
@@ -15,11 +16,41 @@ import (
 
 // Config is the top-level configuration loaded at startup.
 type Config struct {
-	Server      ServerConfig      `yaml:"server"`
-	Storage     StorageConfig     `yaml:"storage"`
-	Embedder    EmbedderConfig    `yaml:"embedder"`
-	VectorIndex VectorIndexConfig `yaml:"vector_index"`
-	Memory      MemoryConfig      `yaml:"memory"`
+	Server      ServerConfig       `yaml:"server"`
+	Storage     StorageConfig      `yaml:"storage"`
+	Embedder    EmbedderConfig     `yaml:"embedder"`
+	VectorIndex VectorIndexConfig  `yaml:"vector_index"`
+	Memory      MemoryConfig       `yaml:"memory"`
+	Tenant      TenantSchemaConfig `yaml:"tenant"`
+}
+
+// TenantSchemaConfig is the optional tenant-tuple schema. When empty,
+// memmy accepts any string-keyed tuple; when set, every Service
+// operation rejects tuples that don't match.
+//
+// Stored memories are NOT migrated when the schema changes —
+// TenantID is derived from the (validated) tuple as today, so data
+// written under one schema remains addressable if the schema is
+// changed back to one that accepts the original tuple shape.
+type TenantSchemaConfig struct {
+	Description string                       `yaml:"description"`
+	Keys        map[string]TenantKeyConfig   `yaml:"keys"`
+	OneOf       [][]string                   `yaml:"one_of"`
+}
+
+// TenantKeyConfig describes one key in the tenant tuple. Tenant values
+// are always strings (Go: map[string]string), so the type is implicit.
+type TenantKeyConfig struct {
+	Description string   `yaml:"description"`
+	Pattern     string   `yaml:"pattern"`
+	Enum        []string `yaml:"enum"`
+	Required    bool     `yaml:"required"`
+}
+
+// IsConfigured reports whether the tenant schema has any rules. An
+// unconfigured schema means "accept any tuple" — today's behavior.
+func (t TenantSchemaConfig) IsConfigured() bool {
+	return len(t.Keys) > 0 || len(t.OneOf) > 0
 }
 
 type ServerConfig struct {
@@ -237,6 +268,9 @@ func (c Config) Validate() error {
 	if len(enabledNames) == 0 {
 		return errors.New("config: at least one server.transports entry must be enabled")
 	}
+	if err := c.Tenant.Validate(); err != nil {
+		return err
+	}
 	// stdio is mutually exclusive with every other transport. The MCP
 	// stdio transport owns the process's stdin/stdout exclusively, so
 	// running an HTTP listener alongside makes no sense (and would put
@@ -274,6 +308,33 @@ const (
 	TransportGRPC  = "grpc"  // reserved
 	TransportHTTP  = "http"  // reserved
 )
+
+// Validate parses regex patterns and cross-checks the tenant schema
+// for internal consistency. Returns nil on success; the schema may
+// then be handed to service.NewTenantSchema.
+func (t TenantSchemaConfig) Validate() error {
+	if !t.IsConfigured() {
+		return nil
+	}
+	for name, k := range t.Keys {
+		if k.Pattern != "" {
+			if _, err := regexp.Compile(k.Pattern); err != nil {
+				return fmt.Errorf("config: tenant.keys.%s.pattern: %w", name, err)
+			}
+		}
+	}
+	for i, set := range t.OneOf {
+		if len(set) == 0 {
+			return fmt.Errorf("config: tenant.one_of[%d] is empty", i)
+		}
+		for _, k := range set {
+			if _, ok := t.Keys[k]; !ok {
+				return fmt.Errorf("config: tenant.one_of[%d] references undeclared key %q", i, k)
+			}
+		}
+	}
+	return nil
+}
 
 // EmbedderDim returns the dimensionality of the configured embedder.
 func (c Config) EmbedderDim() int {

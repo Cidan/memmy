@@ -11,7 +11,11 @@ func (s *Service) Stats(ctx context.Context, req types.StatsRequest) (types.Stat
 	if scanner, ok := s.graph.(statsScanner); ok {
 		var tenants []string
 		if len(req.Tenant) > 0 {
-			tenants = []string{types.TenantID(req.Tenant)}
+			id, err := s.requireValidTenant(req.Tenant)
+			if err != nil {
+				return types.StatsResult{}, err
+			}
+			tenants = []string{id}
 		} else {
 			ts, err := s.graph.ListTenants(ctx)
 			if err != nil {
