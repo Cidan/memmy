@@ -225,20 +225,57 @@ func (c Config) Validate() error {
 	if len(c.Server.Transports) == 0 {
 		return errors.New("config: server.transports must enable at least one transport")
 	}
-	enabled := false
-	for _, t := range c.Server.Transports {
-		if t.Enabled {
-			enabled = true
-			if t.Addr == "" {
-				return errors.New("config: enabled transport missing addr")
-			}
+	var enabledNames []string
+	for name, t := range c.Server.Transports {
+		if !t.Enabled {
+			continue
+		}
+		enabledNames = append(enabledNames, name)
+	}
+	if len(enabledNames) == 0 {
+		return errors.New("config: at least one server.transports entry must be enabled")
+	}
+	// stdio is mutually exclusive with every other transport. The MCP
+	// stdio transport owns the process's stdin/stdout exclusively, so
+	// running an HTTP listener alongside makes no sense (and would put
+	// log lines on the same stream the JSON-RPC frames travel over).
+	stdioEnabled := false
+	for _, name := range enabledNames {
+		if name == TransportStdio {
+			stdioEnabled = true
+			break
 		}
 	}
-	if !enabled {
-		return errors.New("config: at least one server.transports entry must be enabled")
+	if stdioEnabled && len(enabledNames) > 1 {
+		other := make([]string, 0, len(enabledNames)-1)
+		for _, n := range enabledNames {
+			if n != TransportStdio {
+				other = append(other, n)
+			}
+		}
+		return fmt.Errorf("config: transport %q is mutually exclusive with all other transports; also enabled: %v", TransportStdio, other)
+	}
+	for _, name := range enabledNames {
+		t := c.Server.Transports[name]
+		if name == TransportStdio {
+			// stdio has no listen address.
+			continue
+		}
+		if t.Addr == "" {
+			return fmt.Errorf("config: enabled transport %q missing addr", name)
+		}
 	}
 	return nil
 }
+
+// Transport name constants. The set of known names is closed so the
+// validator can reason about mutual exclusivity (stdio).
+const (
+	TransportMCP   = "mcp"   // streamable HTTP MCP transport
+	TransportStdio = "stdio" // MCP over stdin/stdout
+	TransportGRPC  = "grpc"  // reserved
+	TransportHTTP  = "http"  // reserved
+)
 
 // EmbedderDim returns the dimensionality of the configured embedder.
 func (c Config) EmbedderDim() int {

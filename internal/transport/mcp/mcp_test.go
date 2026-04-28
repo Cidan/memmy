@@ -3,6 +3,7 @@ package mcp_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -160,6 +161,75 @@ func TestMCP_Stats(t *testing.T) {
 	}
 	if stats.NodeCount == 0 || stats.HNSWSize == 0 {
 		t.Fatalf("stats unexpectedly zero: %+v", stats)
+	}
+}
+
+// TestMCP_RunTransport_StdioCodePath exercises the Server.Run code path
+// (the same path RunStdio uses against StdioTransport) by wiring the
+// adapter through an in-memory transport pair. This proves the tool
+// surface is identical regardless of transport — the only thing that
+// changes between HTTP and stdio is the bytes-on-the-wire layer.
+func TestMCP_RunTransport_StdioCodePath(t *testing.T) {
+	store, err := bboltstore.Open(bboltstore.Options{
+		Path: filepath.Join(t.TempDir(), "memmy.db"),
+		Dim:  32, RandSeed: 42,
+		FlatScanThreshold: 100000,
+	})
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	svc, err := service.New(
+		store.Graph(), store.VectorIndex(),
+		fake.New(32),
+		clock.NewFake(time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)),
+		service.DefaultConfig(),
+	)
+	if err != nil {
+		t.Fatalf("service: %v", err)
+	}
+	adapter := mcpadapter.New(svc)
+
+	serverT, clientT := mcpsdk.NewInMemoryTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- adapter.RunTransport(ctx, serverT) }()
+
+	client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "test-client", Version: "v0.0.1"}, nil)
+	cs, err := client.Connect(ctx, clientT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+
+	// Round-trip a write through the same RunTransport path stdio uses.
+	res, err := cs.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: "memory.write",
+		Arguments: map[string]any{
+			"tenant":  map[string]string{"agent": "ada"},
+			"message": "stdio path test. second sentence.",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool write: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("write result is error: %+v", res)
+	}
+
+	// Cancel and confirm RunTransport unwinds cleanly.
+	_ = cs.Close()
+	cancel()
+	select {
+	case err := <-serverDone:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunTransport returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunTransport did not return within 2s of context cancellation")
 	}
 }
 

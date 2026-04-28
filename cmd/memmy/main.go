@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -39,6 +40,8 @@ func run() error {
 	configPath := flag.String("config", "memmy.yaml", "path to YAML configuration file")
 	flag.Parse()
 
+	// Logs always go to stderr — in stdio mode stdout is reserved for
+	// the MCP JSON-RPC frame stream.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(logger)
 
@@ -77,6 +80,23 @@ func run() error {
 		return fmt.Errorf("build service: %w", err)
 	}
 
+	// Stdio mode is mutually exclusive with every other transport
+	// (config.Validate enforces this). Run the MCP server directly on
+	// stdin/stdout without a suture supervisor — the foreground call
+	// blocks until ctx is cancelled (signal) or stdin closes.
+	if t, ok := cfg.Server.Transports[config.TransportStdio]; ok && t.Enabled {
+		logger.Info("memmy starting (stdio transport)")
+		adapter := mcpadapter.New(svc)
+		err := adapter.RunStdio(ctx)
+		logger.Info("memmy stopped")
+		// EOF on stdin is the normal "host is done" signal in stdio
+		// mode; treat it (and ctx.Canceled) as graceful exit.
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("stdio transport: %w", err)
+		}
+		return nil
+	}
+
 	supervisor := suture.New("memmy", suture.Spec{
 		EventHook: func(ev suture.Event) {
 			logger.Warn("supervisor event", "event", ev.String())
@@ -88,7 +108,7 @@ func run() error {
 			continue
 		}
 		switch name {
-		case "mcp":
+		case config.TransportMCP:
 			supervisor.Add(&mcpService{
 				adapter: mcpadapter.New(svc),
 				addr:    t.Addr,

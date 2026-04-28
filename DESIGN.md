@@ -764,7 +764,14 @@ These operations are the contract. Every transport adapter must expose all four;
 
 ### 10.2 MCP Adapter (v1)
 
-Implements an MCP server using `github.com/modelcontextprotocol/go-sdk`. Lives in `internal/transport/mcp/`. Tools registered:
+Implements an MCP server using `github.com/modelcontextprotocol/go-sdk`. Lives in `internal/transport/mcp/`. The same tool surface is exposed over **two interchangeable wire transports**:
+
+- **`mcp` (streamable HTTP)** — long-lived process, listens on a configured address, accepts many concurrent client sessions. Use this for the typical server deployment.
+- **`stdio`** — the process is launched as a child by an MCP-aware host (e.g., editor or agent runtime). Reads JSON-RPC frames from stdin, writes responses to stdout. Logs MUST go to stderr so the JSON-RPC stream stays clean.
+
+These two transports are **mutually exclusive** at the config level. `stdio` owns the process's stdin/stdout exclusively; running an HTTP listener alongside makes no sense (and would drift logs onto the JSON-RPC stream). The config validator rejects any configuration in which `stdio` is enabled together with another transport.
+
+Tools registered (identical schema across both transports):
 
 | MCP tool         | Args (JSON)                                                  | Result (JSON)                                                  | Maps to       |
 |------------------|--------------------------------------------------------------|----------------------------------------------------------------|---------------|
@@ -787,7 +794,7 @@ Lives in `internal/transport/http/`. JSON over HTTP, REST-ish (`POST /v1/memory/
 
 - Adapters NEVER touch `Embedder`, `VectorIndex`, or `Graph` directly. Only `MemoryService`.
 - Adapters NEVER hold per-call data state in memory beyond what the wire protocol mandates (e.g., a streaming cursor for the duration of one streamed response).
-- Each adapter is independently enable-able via config. Multiple adapters may run in one process simultaneously.
+- Each adapter is independently enable-able via config. Multiple adapters may run in one process simultaneously, **except** for `stdio`, which is mutually exclusive with all other transports.
 
 ---
 
@@ -824,6 +831,10 @@ server:
     mcp:
       enabled: true
       addr: "0.0.0.0:8765"
+    # stdio is mutually exclusive with every other transport.
+    # Enable EITHER mcp/grpc/http (one or more) OR stdio — not both.
+    stdio:
+      enabled: false
     grpc:
       enabled: false
       addr: "0.0.0.0:8766"

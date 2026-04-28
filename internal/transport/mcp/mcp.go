@@ -55,6 +55,24 @@ func (a *Adapter) HTTPHandler() http.Handler {
 	}, nil)
 }
 
+// RunStdio runs the adapter's MCP server against the SDK's stdio
+// transport (process stdin/stdout). Blocks until ctx is cancelled or
+// the underlying transport returns. Used when memmy is launched as a
+// child process by an MCP-aware tool.
+//
+// Logs MUST be routed to stderr by the caller; stdio mode keeps stdout
+// clean for JSON-RPC framing.
+func (a *Adapter) RunStdio(ctx context.Context) error {
+	return a.srv.Run(ctx, &mcpsdk.StdioTransport{})
+}
+
+// RunTransport runs the adapter's MCP server against an arbitrary
+// transport. Used by tests to wire the same tool surface through an
+// in-memory transport pair.
+func (a *Adapter) RunTransport(ctx context.Context, t mcpsdk.Transport) error {
+	return a.srv.Run(ctx, t)
+}
+
 // ListenAndServe runs an HTTP server bound to addr. Blocks until the
 // underlying server returns. Use Shutdown to stop gracefully.
 func (a *Adapter) ListenAndServe(addr string) error {

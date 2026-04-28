@@ -20,6 +20,8 @@ cp memmy.example.yaml memmy.yaml   # then edit
 
 The default configuration enables the streamable MCP HTTP transport on port 8765 with a fake (deterministic) embedder for development. Switch `embedder.backend` to `gemini` and provide `GEMINI_API_KEY` for production use.
 
+memmy also supports the **MCP stdio transport** for use as a child process under an MCP-aware host (editor or agent runtime). Set `server.transports.stdio.enabled: true` and disable every other transport — stdio is mutually exclusive with HTTP listeners because it owns the process's stdin/stdout. Logs always go to stderr.
+
 ## Tests
 
 ```sh

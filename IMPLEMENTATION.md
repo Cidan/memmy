@@ -140,3 +140,35 @@ Architect-flagged improvements applied without changing the architectural envelo
 - [x] `go build ./...` clean
 - [x] `go test ./...` all green (**64 tests across 13 packages**)
 - [x] `go test -race ./...` all green
+
+## Round 3 — MCP stdio transport
+
+### US-201 — MCP stdio adapter ✅
+- [x] Same tool surface as the streamable HTTP transport (no schema divergence)
+- [x] `Adapter.RunStdio(ctx)` blocks on `Server.Run` against `mcpsdk.StdioTransport{}`
+- [x] `Adapter.RunTransport(ctx, t)` exposed for tests; the integration test wires the same tool surface through `mcpsdk.NewInMemoryTransports` and round-trips `memory.write`
+
+### US-202 — Config: stdio mutually exclusive with all other transports ✅
+- [x] `internal/config` recognizes a `stdio` transport (Enabled=true, no Addr)
+- [x] `Config.Validate` rejects stdio + any other enabled transport, naming both
+- [x] Stdio-only validates without Addr; HTTP transports still require Addr
+- [x] Tests cover every combination: stdio-only accepted; stdio + mcp/grpc/http rejected; stdio + disabled-other accepted
+
+### US-203 — Wire stdio into entrypoint ✅
+- [x] `cmd/memmy/main.go` branches on configured transport: stdio runs `Adapter.RunStdio` directly; HTTP runs under suture
+- [x] Logs always written to stderr — stdout is reserved for JSON-RPC frames
+- [x] Signal-driven graceful shutdown still works (ctx cancel propagates through `Server.Run`)
+- [x] Smoke test: `printf '<initialize JSON-RPC>\n' | ./memmy --config stdio.yaml` returns a valid initialize response on stdout, then EOF on stdin yields exit 0
+
+### US-204 — Documentation ✅
+- [x] DESIGN.md §10.2 describes both HTTP and stdio variants with the mutual-exclusivity rule and rationale
+- [x] DESIGN.md §12 sample config includes the new `stdio` key
+- [x] `memmy.example.yaml` shows both options with comments
+- [x] `README.md` mentions stdio
+- [x] This file: Round 3 documented
+
+### US-205 — Final regression ✅
+- [x] `go vet ./...` clean
+- [x] `go build ./...` clean
+- [x] `go test ./...` all green
+- [x] `go test -race ./...` all green

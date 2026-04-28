@@ -77,3 +77,95 @@ func TestConfig_RejectsZeroDim(t *testing.T) {
 		t.Fatal("expected error for fake.dim == 0")
 	}
 }
+
+// stdio mutual-exclusivity tests (Round 3 / US-202).
+
+func stdioOnlyConfig() config.Config {
+	cfg := config.Default()
+	cfg.Server.Transports = map[string]config.TransportConfig{
+		config.TransportStdio: {Enabled: true}, // no Addr
+	}
+	return cfg
+}
+
+func TestConfig_StdioOnly_Accepted(t *testing.T) {
+	cfg := stdioOnlyConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("stdio-only should validate: %v", err)
+	}
+}
+
+func TestConfig_StdioPlusMCP_Rejected(t *testing.T) {
+	cfg := stdioOnlyConfig()
+	cfg.Server.Transports[config.TransportMCP] = config.TransportConfig{
+		Enabled: true, Addr: "127.0.0.1:8765",
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("stdio + mcp should be rejected")
+	}
+	for _, want := range []string{"stdio", "mutually exclusive", "mcp"} {
+		if !contains(err.Error(), want) {
+			t.Errorf("error message %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestConfig_StdioPlusGRPC_Rejected(t *testing.T) {
+	cfg := stdioOnlyConfig()
+	cfg.Server.Transports[config.TransportGRPC] = config.TransportConfig{
+		Enabled: true, Addr: "127.0.0.1:8766",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("stdio + grpc should be rejected")
+	}
+}
+
+func TestConfig_StdioPlusHTTP_Rejected(t *testing.T) {
+	cfg := stdioOnlyConfig()
+	cfg.Server.Transports[config.TransportHTTP] = config.TransportConfig{
+		Enabled: true, Addr: "127.0.0.1:8767",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("stdio + http should be rejected")
+	}
+}
+
+func TestConfig_StdioPlusDisabledOther_Accepted(t *testing.T) {
+	cfg := stdioOnlyConfig()
+	cfg.Server.Transports[config.TransportMCP] = config.TransportConfig{
+		Enabled: false, Addr: "127.0.0.1:8765",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("stdio + disabled mcp should validate: %v", err)
+	}
+}
+
+func TestConfig_StdioRequiresNoAddr(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.Transports = map[string]config.TransportConfig{
+		config.TransportStdio: {Enabled: true, Addr: ""},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("stdio with empty Addr should be valid: %v", err)
+	}
+}
+
+func TestConfig_HTTPRequiresAddr(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.Transports = map[string]config.TransportConfig{
+		config.TransportMCP: {Enabled: true, Addr: ""},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("mcp transport with empty addr should be rejected")
+	}
+}
+
+func contains(haystack, needle string) bool {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
+}

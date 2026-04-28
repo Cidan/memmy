@@ -1,8 +1,19 @@
 server:
   transports:
+    # MCP streamable HTTP transport. Long-lived process, accepts many
+    # concurrent client sessions. Use this for typical server deployments.
     mcp:
       enabled: true
       addr: "0.0.0.0:8765"
+
+    # MCP stdio transport. The process is launched as a child by an
+    # MCP-aware host (editor / agent runtime); JSON-RPC frames travel
+    # over stdin/stdout. Logs go to stderr.
+    #
+    # MUTUALLY EXCLUSIVE with every other transport. Enable EITHER
+    # mcp/grpc/http (one or more) OR stdio — not both.
+    stdio:
+      enabled: false
 
 storage:
   backend: bbolt
