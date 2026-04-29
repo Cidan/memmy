@@ -4,10 +4,10 @@ go 1.26.2
 
 require (
 	github.com/google/jsonschema-go v0.4.2
+	github.com/mattn/go-sqlite3 v1.14.42
 	github.com/modelcontextprotocol/go-sdk v1.5.0
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/thejerf/suture/v4 v4.0.6
-	go.etcd.io/bbolt v1.4.3
 	google.golang.org/genai v1.54.0
 	gopkg.in/yaml.v3 v3.0.1
 )

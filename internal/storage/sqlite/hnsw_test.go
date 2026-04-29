@@ -1,4 +1,4 @@
-package bboltstore_test
+package sqlitestore_test
 
 import (
 	"context"
@@ -6,14 +6,24 @@ import (
 	"math/rand/v2"
 	"testing"
 
-	bboltstore "github.com/Cidan/memmy/internal/storage/bbolt"
+	sqlitestore "github.com/Cidan/memmy/internal/storage/sqlite"
 	vidx "github.com/Cidan/memmy/internal/vectorindex"
 )
 
-// TestHNSW_OracleVsFlatScan is the load-bearing correctness test for the
-// HNSW implementation: for a non-trivial corpus, top-K returned by HNSW
-// must agree with top-K returned by flat scan above a recall floor.
+// TestHNSW_OracleVsFlatScan is the load-bearing correctness test for
+// the HNSW implementation: for a non-trivial corpus, top-K returned
+// by HNSW must agree with top-K returned by flat scan above a recall
+// floor.
 func TestHNSW_OracleVsFlatScan(t *testing.T) {
+	// 4000 HNSW inserts (2 storages × 2000) + 50 oversampled searches per
+	// storage × 2 paths is intensive. Each insert opens a write tx and
+	// runs O(M·EfConstruction) record reads inside it; the race detector
+	// instruments every CGO/Go boundary call, blowing past the default
+	// 10-minute -race timeout. Skip under -short so `go test -race -short ./...`
+	// stays green; the full corpus still runs under plain `go test ./...`.
+	if testing.Short() {
+		t.Skip("HNSW oracle test is slow; rerun without -short for full coverage")
+	}
 	const (
 		dim         = 32
 		corpus      = 2000
@@ -23,20 +33,18 @@ func TestHNSW_OracleVsFlatScan(t *testing.T) {
 		recallFloor = 0.95 // mean recall@k vs flat oracle (Malkov §4 Alg.4 heuristic)
 	)
 
-	hnswCfg := bboltstore.HNSWConfig{
+	hnswCfg := sqlitestore.HNSWConfig{
 		M:              16,
 		M0:             32,
 		EfConstruction: 200,
 		EfSearch:       oversample,
 		ML:             0.36,
 	}
-	// Storage A — flat scan oracle (threshold above corpus size).
 	stFlat := openTestStorage(t, dim,
 		withFlatScanThreshold(corpus+1),
 		withHNSW(hnswCfg),
 		withRandSeed(101),
 	)
-	// Storage B — HNSW (threshold = 1, corpus ≫ 1).
 	stHNSW := openTestStorage(t, dim,
 		withFlatScanThreshold(1),
 		withHNSW(hnswCfg),
@@ -68,7 +76,6 @@ func TestHNSW_OracleVsFlatScan(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Truncate both to top-k and compute recall.
 		topFlat := truncateIDs(flatHits, k)
 		topHNSW := truncateIDs(hnswHits, k)
 		gold := make(map[string]struct{}, k)
@@ -128,7 +135,6 @@ func TestHNSW_Delete_FixesNeighborLists(t *testing.T) {
 		ids[i] = fmt.Sprintf("n-%02d", i)
 		_ = v.Insert(ctx, "t", ids[i], randVec(r, 8))
 	}
-	// Delete half.
 	for i := 0; i < N/2; i++ {
 		if err := v.Delete(ctx, "t", ids[i]); err != nil {
 			t.Fatal(err)
@@ -138,7 +144,6 @@ func TestHNSW_Delete_FixesNeighborLists(t *testing.T) {
 	if sz != N/2 {
 		t.Fatalf("Size=%d, want %d", sz, N/2)
 	}
-	// Search should still work and never return a deleted ID.
 	got, _ := v.Search(ctx, "t", randVec(r, 8), 10)
 	deleted := make(map[string]struct{}, N/2)
 	for i := 0; i < N/2; i++ {
@@ -168,8 +173,6 @@ func TestHNSW_Empty(t *testing.T) {
 }
 
 func TestHNSW_BackendSelection_BelowThreshold(t *testing.T) {
-	// With threshold > corpus, search must use flat scan and produce
-	// exact top-K (no recall loss).
 	const dim = 16
 	st := openTestStorage(t, dim, withFlatScanThreshold(1000))
 	v := st.VectorIndex()
@@ -184,14 +187,9 @@ func TestHNSW_BackendSelection_BelowThreshold(t *testing.T) {
 	}
 	q := randVec(r, dim)
 	got, _ := v.Search(ctx, "t", q, 5)
-
-	// Build oracle.
-	oracle, _ := openTestStorage(t, dim, withFlatScanThreshold(100000)).VectorIndex().Size(ctx, "t")
-	_ = oracle
 	if len(got) != 5 {
 		t.Fatalf("len=%d", len(got))
 	}
-	// Exact-top-K tested elsewhere; here just sanity-check non-trivial similarity.
 	prev := got[0].Sim
 	for _, h := range got[1:] {
 		if h.Sim > prev {
@@ -200,4 +198,3 @@ func TestHNSW_BackendSelection_BelowThreshold(t *testing.T) {
 		prev = h.Sim
 	}
 }
-

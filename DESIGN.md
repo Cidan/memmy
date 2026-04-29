@@ -1,6 +1,6 @@
 # memmy — Design Document
 
-memmy is an LLM memory system written in pure Go (toolchain: **Go 1.26.2**), exposed over MCP — and, in the future, gRPC and HTTP — providing associative, decay-aware memory for one or more agents. Memory is scoped by a flexible identity tuple (e.g., `(agent)`, `(agent, user)`, or arbitrary key/value pairs).
+memmy is an LLM memory system written in Go (toolchain: **Go 1.26.2**), exposed over MCP — and, in the future, gRPC and HTTP — providing associative, decay-aware memory for one or more agents. Memory is scoped by a flexible identity tuple (e.g., `(agent)`, `(agent, user)`, or arbitrary key/value pairs).
 
 This document is the source of truth for architecture and design rationale. Code conventions live in `CLAUDE.md`.
 
@@ -10,7 +10,7 @@ This document is the source of truth for architecture and design rationale. Code
 
 These principles override convenience. If a section below appears to violate one of them, the section is wrong.
 
-1. **One source of truth: the database.** Vectors, nodes, messages, memory association edges, **and the HNSW navigation graph** all live in the configured storage backend. No secondary store, no external search engine, no parallel index file. The reference backend in v1 is bbolt; the same logical data model maps to Postgres, MariaDB, Bigtable, Spanner, and other stores that satisfy the interface contracts in §9.
+1. **One source of truth: the database.** Vectors, nodes, messages, memory association edges, **and the HNSW navigation graph** all live in the configured storage backend. No secondary store, no external search engine, no parallel index file. The reference backend in v1 is SQLite (WAL mode, via the `mattn/go-sqlite3` CGO driver); the same logical data model maps to Postgres, MariaDB, Bigtable, Spanner, and other stores that satisfy the interface contracts in §9.
 
 2. **Storage is pluggable; retrieval policy is not.** Storage backends are interchangeable behind the `Graph` and `VectorIndex` interfaces. Retrieval scoring, oversampling, memory-edge reinforcement, lazy decay, and HNSW algorithm correctness live in the Memory Service and do not change per backend. Swapping the backend must not change observable retrieval behavior — only latency and operational characteristics.
 
@@ -19,7 +19,7 @@ These principles override convenience. If a section below appears to violate one
    - the loaded configuration (read-only),
    - process-local backpressure primitives (semaphores, rate limiters).
 
-   There are no caches of database content, no in-memory tenant registries, no in-memory vector indexes, no globally held weight or counter state, no shadow copies of `HNSWMeta`. Per-request transient state — priority queues, heaps, decoded vector buffers, visited-sets — is created and freed within the request's scope. This is a hard constraint, not an aspiration: it enables **horizontal scale-out via N stateless memmy nodes** against a shared multi-writer backend (Postgres, Bigtable, Spanner). The bbolt reference backend is single-process by file-lock semantics — that's a property of bbolt, not of memmy.
+   There are no caches of database content, no in-memory tenant registries, no in-memory vector indexes, no globally held weight or counter state, no shadow copies of `HNSWMeta`. Per-request transient state — priority queues, heaps, decoded vector buffers, visited-sets — is created and freed within the request's scope. This is a hard constraint, not an aspiration: it enables **horizontal scale-out via N stateless memmy nodes** against a shared multi-writer backend (Postgres, Bigtable, Spanner). The SQLite reference backend supports multi-process access through WAL mode (many readers + one writer at a time) — N memmy or library-embedded processes can share the same database file without coordination beyond SQLite's reserved-lock serialization.
 
 4. **Transport adapters wrap a single Memory Service.** All transports — MCP, gRPC, HTTP, future — call into one transport-agnostic `MemoryService` interface (§9). Transport-specific concerns (MCP tool registration, protobuf service definitions, HTTP route handlers) live in their adapters. The Memory Service does not know which transport invoked it.
 
@@ -37,7 +37,7 @@ These principles override convenience. If a section below appears to violate one
 - Persistent, associative memory for LLM agents.
 - Multi-tenant by arbitrary identity tuple.
 - **Pluggable** at every external boundary, behind Go interfaces:
-  - **Storage** v1: bbolt. Future: Postgres, MariaDB, Bigtable, Spanner, badger, pebble.
+  - **Storage** v1: SQLite (WAL mode, `mattn/go-sqlite3`). Future: Postgres, MariaDB, Bigtable, Spanner, badger, pebble.
   - **Transport** v1: MCP via `github.com/modelcontextprotocol/go-sdk`. Future: gRPC + HTTP.
   - **Embedder** v1: Gemini via `go-genai`.
 - Memory association edges that **strengthen with use** (Hebbian) and **decay with disuse** (exponential).
@@ -86,7 +86,7 @@ These principles override convenience. If a section below appears to violate one
               │                  │                  │
         ┌─────▼─────┐      ┌─────▼──────────────────▼─────┐
         │ go-genai  │      │      Storage Backend          │
-        │ (Gemini)  │      │  bbolt | postgres | bigtable  │
+        │ (Gemini)  │      │  sqlite | postgres | bigtable │
         │           │      │  spanner | mariadb | …        │
         └───────────┘      └───────────────────────────────┘
 ```
@@ -235,7 +235,7 @@ Persisted once per message. Returned alongside chunks during retrieval so caller
 
 ### 4.6 Logical Data Model (collections)
 
-The data model is described in terms of **collections** keyed by tenant + identifier(s). Each storage backend maps these to its native primitives — bbolt buckets, SQL tables, Bigtable column families, Spanner interleaved tables, etc. The collections themselves and the keying scheme are part of the design contract; the physical layout is the backend's concern.
+The data model is described in terms of **collections** keyed by tenant + identifier(s). Each storage backend maps these to its native primitives — SQL tables (the SQLite reference uses one table per collection with composite primary keys), Bigtable column families, Spanner interleaved tables, etc. The collections themselves and the keying scheme are part of the design contract; the physical layout is the backend's concern.
 
 | Collection            | Key                          | Value                          | Owner       |
 |-----------------------|------------------------------|--------------------------------|-------------|
@@ -249,7 +249,7 @@ The data model is described in terms of **collections** keyed by tenant + identi
 | `memory_edges_in` ¹   | `(TenantID, ToID, FromID)`   | `MemoryEdge` (mirror)          | Graph       |
 | `tenant_counters` ²   | `TenantID`                   | `{NodeCount, EdgeCount, SumNodeWeight, SumEdgeWeight}` | Graph |
 
-¹ The `_in` mirror is required only for backends that don't support efficient lookups in both directions natively. KV backends (bbolt, badger, pebble, Bigtable) need the mirror because prefix scans only work on a single key prefix. SQL backends with proper secondary indexes can collapse `out` and `in` into one `memory_edges` table. The interface contract is "neighbor lookup is efficient in either direction"; how the backend gets there is its problem.
+¹ The `_in` mirror is required only for backends that don't support efficient lookups in both directions natively. KV backends (badger, pebble, Bigtable) need the mirror because prefix scans only work on a single key prefix. SQL backends with proper secondary indexes can collapse `out` and `in` into one `memory_edges` table — the SQLite reference backend nevertheless ships both mirrors as separate tables, each with its own composite primary key, for symmetry with future KV backends and so per-direction neighbor scans are a single PK range read. The interface contract is "neighbor lookup is efficient in either direction"; how the backend gets there is its problem.
 
 ² `tenant_counters` backs the `Stats` operation in O(1) per tenant. Maintained transactionally by every Graph mutation (`PutNode`, `UpdateNode`, `DeleteNode`, `PutEdge`, `UpdateEdge`, `DeleteEdge`) — upsert paths capture an old-weight delta; brand-new paths increment the count. Backends MAY skip this collection if they can answer Stats without walking buckets via native counts/aggregates (e.g., SQL `COUNT(*)` + `SUM(weight)` with appropriate indexes).
 
@@ -261,33 +261,37 @@ The data model is described in terms of **collections** keyed by tenant + identi
 
 **Interface-ownership rule.** `Graph` writes only to the collections it owns (`nodes`, `messages`, `memory_edges_*`). `VectorIndex` writes only to its collections (`vectors`, `hnsw_*`). The Memory Service may compose calls across both, but neither implementation may write the other's collections.
 
-### 4.7 Reference Layout: bbolt
+### 4.7 Reference Layout: SQLite
 
+The v1 reference backend is SQLite in WAL mode, accessed through the `mattn/go-sqlite3` CGO driver. Two `*sql.DB` handles share the same file: a writer DB pinned to one connection with `_txlock=immediate` (so every write tx grabs SQLite's RESERVED lock upfront, avoiding the SQLITE_BUSY upgrade race), and a reader DB with the default deferred mode (so multiple snapshot reads can run concurrently with the writer in WAL mode). Schema is bootstrapped on Open and idempotent.
+
+```sql
+CREATE TABLE tenants      (id TEXT PRIMARY KEY, info BLOB NOT NULL);
+CREATE TABLE nodes        (tenant TEXT, id TEXT, blob BLOB NOT NULL,
+                           PRIMARY KEY (tenant, id));
+CREATE TABLE messages     (tenant TEXT, id TEXT, blob BLOB NOT NULL,
+                           PRIMARY KEY (tenant, id));
+CREATE TABLE vectors      (tenant TEXT, node_id TEXT, vec BLOB NOT NULL,
+                           PRIMARY KEY (tenant, node_id));
+CREATE TABLE hnsw_meta    (tenant TEXT PRIMARY KEY, blob BLOB NOT NULL);
+CREATE TABLE hnsw_records (tenant TEXT, node_id TEXT, blob BLOB NOT NULL,
+                           PRIMARY KEY (tenant, node_id));
+CREATE TABLE edges_out    (tenant TEXT, from_id TEXT, to_id TEXT, blob BLOB NOT NULL,
+                           PRIMARY KEY (tenant, from_id, to_id));
+CREATE TABLE edges_in     (tenant TEXT, to_id TEXT, from_id TEXT, blob BLOB NOT NULL,
+                           PRIMARY KEY (tenant, to_id, from_id));
+CREATE TABLE counters     (tenant TEXT PRIMARY KEY, blob BLOB NOT NULL);
+CREATE TABLE meta         (key TEXT PRIMARY KEY, value BLOB);
 ```
-root
-├── tenants/                                            # tenants registry
-│   └── <tenantID> → gob(TenantInfo)
-├── t/                                                  # per-tenant data
-│   └── <tenantID>/
-│       ├── nodes/    <nodeID>          → gob(Node)
-│       ├── msgs/     <msgID>           → gob(Message)
-│       ├── vec/      <nodeID>          → []byte                # raw f32 LE, normalized
-│       ├── hnsw/
-│       │   ├── meta                    → gob(HNSWMeta)
-│       │   └── records/<nodeID>        → gob(HNSWRecord)
-│       ├── eout/     <fromID>/<toID>   → gob(MemoryEdge)       # outbound
-│       ├── ein/      <toID>/<fromID>   → gob(MemoryEdge)       # mirror
-│       └── counters/ v                 → gob(tenantCounters)   # O(1) Stats backing
-└── meta/
-    └── schema_version → uint32
-```
 
-bbolt's nested buckets express the logical model directly. Sketches for other backends:
+All tables are `WITHOUT ROWID` so the primary key is the physical clustering. `edges_out` and `edges_in` are deliberately separate tables: `edges_out` is the authoritative mirror; `edges_in` is the inverted lookup for `InboundNeighbors`. Both are written atomically inside one transaction by every `PutEdge` / `UpdateEdge` / `DeleteEdge` to maintain DESIGN.md §0 #6 — "memory-edge updates are atomic across both directions." Records are gob-encoded blobs except for vectors, which are raw little-endian float32 bytes (§4.8).
 
-- **Postgres / MariaDB**: each collection becomes a table with a composite primary key matching the logical key. `memory_edges` collapses into one table with two indexes on `(tenant, from)` and `(tenant, to)`. Vectors stored as `bytea` (or `vector` via pgvector if used purely as opaque bytes for our distance computation).
+Sketches for other backends:
+
+- **Postgres / MariaDB**: same shape; `BLOB` becomes `BYTEA` / `LONGBLOB`. Vectors stored as raw bytes (or `vector` via pgvector if used purely as opaque bytes for our distance computation).
 - **Bigtable**: row key `tenant#kind#id` (e.g., `t01#vec#01J...`), with one column family per logical category. `hnsw_records` and `vectors` can share a row but live in distinct families.
 - **Spanner**: parent table `Tenants(tenant_id)`, with `Nodes`, `Vectors`, `HnswRecords`, `MemoryEdges` interleaved under it for locality.
-- **badger / pebble**: same pattern as bbolt; key prefixing replaces nested buckets.
+- **badger / pebble**: composite key prefixes `tenant/<id>/...` replace SQL composite primary keys; semantics are identical.
 
 Implementations live in `internal/storage/<backend>/` and must pass the storage compatibility test suite (§14).
 
@@ -424,7 +428,7 @@ HNSWSearch(tenantID, qVec, oversampleN):
 - Each visit reads `hnsw_records[nodeID]` (neighbor list) + `vectors[nodeID]` (vector). Two storage point lookups per visited node.
 - Visited-set is `map[string]struct{}` bounded by `O(ef × MaxLayer)` per query — small, per-query, freed at return.
 
-The backend's native cache (OS page cache for bbolt, buffer pool for SQL, internal cache for Bigtable/Spanner) keeps hot regions of the graph warm; cold regions live on disk until needed. memmy never explicitly caches HNSW records or vectors at the application layer — that would violate §0 #3.
+The backend's native cache (SQLite page cache, Postgres buffer pool, internal cache for Bigtable/Spanner) keeps hot regions of the graph warm; cold regions live on disk until needed. memmy never explicitly caches HNSW records or vectors at the application layer — that would violate §0 #3.
 
 ### 6.4 Weight-aware reranking (both modes)
 
@@ -831,7 +835,7 @@ type Graph interface {
 
 `UpdateNode` / `UpdateEdge` take a closure so the read-modify-write happens inside a single backend transaction. This is essential for atomic decay+reinforce.
 
-Storage implementations live in `internal/storage/<backend>/` (e.g., `internal/storage/bbolt/`). Each backend implements both `Graph` and `VectorIndex` against the same physical store.
+Storage implementations live in `internal/storage/<backend>/` (e.g., `internal/storage/sqlite/`). Each backend implements both `Graph` and `VectorIndex` against the same physical store.
 
 ---
 
@@ -904,7 +908,7 @@ RootSupervisor
 └── MaintenanceService         // periodic stats; writes only to the storage backend
 ```
 
-Each service implements `suture.Service`. `StorageService` is the lone owner of the storage backend handle (e.g., bbolt `*DB`, SQL `*sql.DB`, Bigtable `*Client`); `VectorIndex` and `Graph` borrow it. Each transport adapter is a separate `suture.Service`; multiple may run simultaneously based on config.
+Each service implements `suture.Service`. `StorageService` is the lone owner of the storage backend handles (e.g., the SQLite writer + reader `*sql.DB` pair, Bigtable `*Client`); `VectorIndex` and `Graph` borrow them. Each transport adapter is a separate `suture.Service`; multiple may run simultaneously based on config.
 
 `MaintenanceService` is permitted because anything it computes is written back to the database — it holds no state, only periodically reads the database, computes stats, and writes them back to a `tenants/<id>/stats` record (or equivalent). Killing and restarting it has no consequences.
 
@@ -934,8 +938,8 @@ server:
       addr: "0.0.0.0:8767"
 
 storage:
-  backend: bbolt              # bbolt | postgres | mariadb | bigtable | spanner | ...
-  bbolt:
+  backend: sqlite             # sqlite | postgres | mariadb | bigtable | spanner | ...
+  sqlite:
     path: "./data/memmy.db"
   # postgres:
   #   dsn_env: "MEMMY_PG_DSN"
@@ -1027,7 +1031,7 @@ tenant:
 
 Concurrency semantics depend on the chosen storage backend. The Memory Service is written against the interface contracts; backend implementations are responsible for their own concurrency control.
 
-- **bbolt** is single-writer at the file level AND single-process by file lock. The bbolt implementation serializes writes through one goroutine; reads are concurrent.
+- **SQLite (WAL)** supports many concurrent readers and one writer at a time, coordinated by file locks (the writer holds the RESERVED lock; readers hold SHARED snapshots backed by the WAL). Critically, multiple **processes** can open the same database file simultaneously — readers do not block on the writer in WAL mode, and writers serialize on the reserved lock with a configurable `busy_timeout`. The SQLite implementation uses two `*sql.DB` handles per Storage (one with `_txlock=immediate` capped at a single connection for writes; one with deferred mode for reads), so transient stores embedded in N processes share state cleanly.
 - **Postgres / MariaDB / Spanner / Bigtable** support concurrent writers natively and across multiple processes. Their implementations exploit that; the Memory Service does not need to know.
 - **HNSW insert** is a multi-record write within ONE storage transaction. Atomicity is required by all backends.
 - **Embedder**: shared HTTP client; concurrency limited by a process-local semaphore. Embedding happens **outside** any storage tx.
@@ -1058,7 +1062,7 @@ memmy is stateless across requests by design (§0 #3). This subsection enumerate
 
 ### 13.3 Multi-node deployment
 
-When N memmy processes share a multi-writer backend (Postgres, Bigtable, Spanner), the application code is identical to the single-process case. Operational considerations:
+When N memmy processes share a multi-writer backend (Postgres, Bigtable, Spanner) or the SQLite WAL reference backend, the application code is identical to the single-process case. Operational considerations:
 
 - **Race on lazy reinforcement** — handled per §8.7.
 - **Race on HNSW insert** — backend's transactional guarantees serialize entry-point/maxLayer changes; algorithm correctness is preserved.
@@ -1066,13 +1070,13 @@ When N memmy processes share a multi-writer backend (Postgres, Bigtable, Spanner
 - **Configuration** — every node loads the same config. Config rollouts are deploy events, not runtime concerns.
 - **Sticky sessions** — none required. Any node can serve any request.
 
-bbolt deployments are single-node by file-lock semantics; the application is the same code, just with one process.
+SQLite WAL deployments support multiple cooperating processes against one database file (e.g., several CLI agents embedding memmy as a library). Networked backends (Postgres, Spanner, Bigtable) extend the same pattern across hosts.
 
 ---
 
 ## 14. Testing Strategy
 
-- **Real storage backend in tests** — `t.TempDir()` for embedded backends, test container or shared dev instance for networked backends. **No mocks for storage.** v1 ships with bbolt; the test suite runs against bbolt. As additional backends are added, the same test suite must run against each.
+- **Real storage backend in tests** — `t.TempDir()` for embedded backends, test container or shared dev instance for networked backends. **No mocks for storage.** v1 ships with SQLite (CGO via `mattn/go-sqlite3`); the test suite runs against SQLite. As additional backends are added, the same test suite must run against each.
 - **Storage compatibility test suite** — a portable suite verifies any backend implementing `Graph` + `VectorIndex` against the contract: CRUD correctness, prefix-scan ordering, transaction atomicity (including aborted txs leaving consistent state), bidirectional neighbor lookup, and tombstone semantics. Every new backend must pass before merge.
 - **HNSW oracle test** — property-based: for each random (corpus, query) pair, top-K from HNSW agrees with top-K from flat scan above a configured recall floor (e.g., recall@k ≥ 0.95 for k=8 with `oversampleN=300`). Run on multiple corpus sizes spanning the threshold.
 - **Service-level tests** — target `MemoryService` directly without any transport adapter. Proves the service is transport-agnostic and that adapters can be swapped without re-validating service logic.
@@ -1081,14 +1085,14 @@ bbolt deployments are single-node by file-lock semantics; the application is the
 - **Live Gemini smoke test**: gated behind `GEMINI_API_KEY`, skipped otherwise.
 - **Property tests** for chunking (idempotence, span correctness), decay (monotone in `dt`, bounded by `weightCap`, time-symmetric within ε under reinforcement), and HNSW invariants (every link is bidirectional; entry point exists; layer histogram approximately exponential).
 - **Statelessness check** — a test that runs N concurrent requests against a process and asserts no module under `internal/` accumulates persistent state visible from a runtime introspection point. Easier in practice: code review + a periodic `pprof heap` snapshot in CI that fails if non-connection allocations grow with request count.
-- **Multi-node simulation (post-bbolt)** — once a multi-writer backend lands, run two memmy instances against the same backend in tests, hammer concurrent reads/writes, and assert correctness invariants hold.
+- **Multi-handle simulation** — `TestMultiHandle_ConcurrentReadWrite` opens two `*Storage` handles against the same SQLite file and asserts cross-handle commit visibility. Future networked-backend ports should add an analogous multi-instance test.
 - **Clock injection**: a `Clock` interface (`Now() time.Time`) plumbed wherever decay math runs.
 
 ---
 
 ## 15. Open Questions / Future Work
 
-- **Additional storage backends.** Beyond bbolt: Postgres, MariaDB, Bigtable, Spanner, badger, pebble. Each implements `Graph` + `VectorIndex` and passes the storage compatibility suite (§14).
+- **Additional storage backends.** Beyond SQLite: Postgres, MariaDB, Bigtable, Spanner, badger, pebble. Each implements `Graph` + `VectorIndex` and passes the storage compatibility suite (§14).
 - **Additional transports.** gRPC (with proto stubs, mTLS, structured authn) and HTTP (REST-ish, JSON, gateway-friendly). Both wrap the existing `MemoryService` — no service changes required.
 - **Multi-node memmy.** Statelessness (§0 #3) means N memmy processes can run against the same multi-writer backend with no coordination. Operational concerns: load balancer, embedder rate-limit coordination if needed.
 - **Sentence splitter quality.** Rule-based first. Revisit with model-based if quality is poor.
@@ -1123,7 +1127,7 @@ bbolt deployments are single-node by file-lock semantics; the application is the
 - **HNSW** — Hierarchical Navigable Small World; the disk-resident ANN index over the `vectors` collection. Layered graph, navigation by greedy descent + ef-search.
 - **Oversample** — pulling top-N candidates with N ≫ K so weight-aware reranking has room to lift hot-but-moderately-similar memories.
 - **Flat scan** — storage cursor over `vectors`, computing similarity per visit, top-N heap. Memory O(N) per query, regardless of corpus size.
-- **Storage backend** — the concrete implementation of `Graph` + `VectorIndex` rooted at a physical store. v1: bbolt. Future: Postgres, MariaDB, Bigtable, Spanner, badger, pebble.
+- **Storage backend** — the concrete implementation of `Graph` + `VectorIndex` rooted at a physical store. v1: SQLite (WAL mode). Future: Postgres, MariaDB, Bigtable, Spanner, badger, pebble.
 - **Collection** — a logical grouping of records with a shared key shape (e.g., `vectors`, `nodes`). Each backend maps collections to its native primitive (bucket, table, column family).
 - **Port IN / Port OUT** — ports-and-adapters terminology. Port IN (`MemoryService`) defines what the application accepts; ports OUT (`Embedder`, `VectorIndex`, `Graph`) define what the application requires.
 - **Transport adapter** — implementation that translates a wire protocol (MCP, gRPC, HTTP) to/from `MemoryService`.

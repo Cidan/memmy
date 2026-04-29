@@ -1,6 +1,8 @@
-package bboltstore
+package sqlitestore
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
@@ -9,14 +11,12 @@ import (
 	"sort"
 	"sync"
 
-	"go.etcd.io/bbolt"
-
-	vidx "github.com/Cidan/memmy/internal/vectorindex"
 	"github.com/Cidan/memmy/internal/types"
+	vidx "github.com/Cidan/memmy/internal/vectorindex"
 )
 
-// hnswRand is a small wrapper that protects a *rand.Rand with a mutex so
-// concurrent writers cannot race on the layer-sampling source.
+// hnswRand wraps *rand.Rand with a mutex so concurrent writers cannot
+// race on the layer-sampling source.
 type hnswRand struct {
 	mu sync.Mutex
 	r  *rand.Rand
@@ -44,33 +44,16 @@ func (h *hnswRand) sampleLayer(mL float64) int {
 	return int(math.Floor(-math.Log(u) * mL))
 }
 
-// ----- bucket helpers -----
+// ----- HNSW row helpers -----
 
-func hnswRoot(tx *bbolt.Tx, tenant string, create bool) (*bbolt.Bucket, error) {
-	t, err := tenantBucket(tx, tenant, create)
-	if err != nil {
-		return nil, err
-	}
-	return subBucket(t, bktHNSW, create)
-}
-
-func hnswRecords(tx *bbolt.Tx, tenant string, create bool) (*bbolt.Bucket, error) {
-	root, err := hnswRoot(tx, tenant, create)
-	if err != nil || root == nil {
-		return root, err
-	}
-	return subBucket(root, bktHNSWRecords, create)
-}
-
-// readHNSWMeta returns (meta, found, error).
-func readHNSWMeta(tx *bbolt.Tx, tenant string) (types.HNSWMeta, bool, error) {
-	root, err := hnswRoot(tx, tenant, false)
-	if err != nil || root == nil {
-		return types.HNSWMeta{}, false, err
-	}
-	raw := root.Get([]byte(keyHNSWMeta))
-	if raw == nil {
+func readHNSWMetaTx(ctx context.Context, tx *sql.Tx, tenant string) (types.HNSWMeta, bool, error) {
+	var raw []byte
+	err := tx.QueryRowContext(ctx, `SELECT blob FROM hnsw_meta WHERE tenant = ?`, tenant).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
 		return types.HNSWMeta{}, false, nil
+	}
+	if err != nil {
+		return types.HNSWMeta{}, false, err
 	}
 	var m types.HNSWMeta
 	if err := decodeHNSWMeta(raw, &m); err != nil {
@@ -79,26 +62,26 @@ func readHNSWMeta(tx *bbolt.Tx, tenant string) (types.HNSWMeta, bool, error) {
 	return m, true, nil
 }
 
-func writeHNSWMeta(tx *bbolt.Tx, tenant string, m *types.HNSWMeta) error {
-	root, err := hnswRoot(tx, tenant, true)
-	if err != nil {
-		return err
-	}
+func writeHNSWMetaTx(ctx context.Context, tx *sql.Tx, tenant string, m *types.HNSWMeta) error {
 	buf, err := encodeHNSWMeta(m)
 	if err != nil {
 		return err
 	}
-	return root.Put([]byte(keyHNSWMeta), buf)
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO hnsw_meta(tenant, blob) VALUES(?, ?)
+		ON CONFLICT(tenant) DO UPDATE SET blob = excluded.blob
+	`, tenant, buf)
+	return err
 }
 
-func readHNSWRecord(tx *bbolt.Tx, tenant, nodeID string) (types.HNSWRecord, bool, error) {
-	rb, err := hnswRecords(tx, tenant, false)
-	if err != nil || rb == nil {
-		return types.HNSWRecord{}, false, err
-	}
-	raw := rb.Get([]byte(nodeID))
-	if raw == nil {
+func readHNSWRecordTx(ctx context.Context, tx *sql.Tx, tenant, nodeID string) (types.HNSWRecord, bool, error) {
+	var raw []byte
+	err := tx.QueryRowContext(ctx, `SELECT blob FROM hnsw_records WHERE tenant = ? AND node_id = ?`, tenant, nodeID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
 		return types.HNSWRecord{}, false, nil
+	}
+	if err != nil {
+		return types.HNSWRecord{}, false, err
 	}
 	var r types.HNSWRecord
 	if err := decodeHNSWRecord(raw, &r); err != nil {
@@ -107,32 +90,29 @@ func readHNSWRecord(tx *bbolt.Tx, tenant, nodeID string) (types.HNSWRecord, bool
 	return r, true, nil
 }
 
-func writeHNSWRecord(tx *bbolt.Tx, tenant string, r *types.HNSWRecord) error {
-	rb, err := hnswRecords(tx, tenant, true)
-	if err != nil {
-		return err
-	}
+func writeHNSWRecordTx(ctx context.Context, tx *sql.Tx, tenant string, r *types.HNSWRecord) error {
 	buf, err := encodeHNSWRecord(r)
 	if err != nil {
 		return err
 	}
-	return rb.Put([]byte(r.NodeID), buf)
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO hnsw_records(tenant, node_id, blob) VALUES(?, ?, ?)
+		ON CONFLICT(tenant, node_id) DO UPDATE SET blob = excluded.blob
+	`, tenant, r.NodeID, buf)
+	return err
 }
 
-func deleteHNSWRecord(tx *bbolt.Tx, tenant, nodeID string) error {
-	rb, err := hnswRecords(tx, tenant, false)
-	if err != nil || rb == nil {
-		return err
-	}
-	return rb.Delete([]byte(nodeID))
+func deleteHNSWRecordTx(ctx context.Context, tx *sql.Tx, tenant, nodeID string) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM hnsw_records WHERE tenant = ? AND node_id = ?`, tenant, nodeID)
+	return err
 }
 
 // ----- HNSW insert (Malkov §4 Alg.1) -----
 
 // hnswInsertTx links a new node into the HNSW graph inside the given tx.
-// The vector must already be persisted to vec/ by the caller. All HNSW
-// reads and writes happen here within the same tx.
-func (s *Storage) hnswInsertTx(tx *bbolt.Tx, tenant, nodeID string, vec []float32) error {
+// The vector must already be persisted to vectors by the caller. All
+// HNSW reads and writes happen here within the same tx.
+func (s *Storage) hnswInsertTx(ctx context.Context, tx *sql.Tx, tenant, nodeID string, vec []float32) error {
 	if s.rand == nil {
 		// Defensive — Open should always set this.
 		s.rand = newHNSWRand(1)
@@ -141,15 +121,15 @@ func (s *Storage) hnswInsertTx(tx *bbolt.Tx, tenant, nodeID string, vec []float3
 	// Upsert path: if nodeID already exists, fully remove it from the
 	// graph (cleaning neighbors, decrementing Size, replacing entry
 	// point if needed) so we re-insert into a consistent state.
-	if _, ok, err := readHNSWRecord(tx, tenant, nodeID); err != nil {
+	if _, ok, err := readHNSWRecordTx(ctx, tx, tenant, nodeID); err != nil {
 		return err
 	} else if ok {
-		if err := s.hnswDeleteTx(tx, tenant, nodeID); err != nil {
+		if err := s.hnswDeleteTx(ctx, tx, tenant, nodeID); err != nil {
 			return err
 		}
 	}
 
-	meta, found, err := readHNSWMeta(tx, tenant)
+	meta, found, err := readHNSWMetaTx(ctx, tx, tenant)
 	if err != nil {
 		return err
 	}
@@ -164,33 +144,31 @@ func (s *Storage) hnswInsertTx(tx *bbolt.Tx, tenant, nodeID string, vec []float3
 		}
 	}
 
-	// Sample insertion layer.
 	L := s.rand.sampleLayer(meta.ML)
 
-	// First node ever (or first after full deletion): trivial.
 	if meta.Size == 0 {
 		rec := types.HNSWRecord{
 			NodeID:    nodeID,
 			Layer:     L,
 			Neighbors: emptyNeighbors(L),
 		}
-		if err := writeHNSWRecord(tx, tenant, &rec); err != nil {
+		if err := writeHNSWRecordTx(ctx, tx, tenant, &rec); err != nil {
 			return err
 		}
 		meta.EntryPoint = nodeID
 		meta.MaxLayer = L
 		meta.Size = 1
-		return writeHNSWMeta(tx, tenant, &meta)
+		return writeHNSWMetaTx(ctx, tx, tenant, &meta)
 	}
 
 	// Phase 1 — greedy descent from MaxLayer down to L+1 with ef=1.
 	cur := meta.EntryPoint
-	curDist, err := s.distTo(tx, tenant, cur, vec)
+	curDist, err := s.distToTx(ctx, tx, tenant, cur, vec)
 	if err != nil {
 		return err
 	}
 	for ℓ := meta.MaxLayer; ℓ > L; ℓ-- {
-		cur, curDist, err = s.greedyDescentTx(tx, tenant, cur, curDist, vec, ℓ)
+		cur, curDist, err = s.greedyDescentTx(ctx, tx, tenant, cur, curDist, vec, ℓ)
 		if err != nil {
 			return err
 		}
@@ -207,7 +185,7 @@ func (s *Storage) hnswInsertTx(tx *bbolt.Tx, tenant, nodeID string, vec []float3
 
 	entryPoints := []candidate{{id: cur, dist: curDist}}
 	for ℓ := startLayer; ℓ >= 0; ℓ-- {
-		W, err := s.searchLayerTx(tx, tenant, vec, entryPoints, meta.EfConstruction, ℓ)
+		W, err := s.searchLayerTx(ctx, tx, tenant, vec, entryPoints, meta.EfConstruction, ℓ)
 		if err != nil {
 			return err
 		}
@@ -217,35 +195,31 @@ func (s *Storage) hnswInsertTx(tx *bbolt.Tx, tenant, nodeID string, vec []float3
 		}
 		chosen := selectNeighborsHeuristic(W, mTarget)
 
-		// Set rec.Neighbors[ℓ] from chosen (in dist-ascending order).
 		ids := make([]string, len(chosen))
 		for i, c := range chosen {
 			ids[i] = c.id
 		}
 		rec.Neighbors[ℓ] = ids
 
-		// Bidirectional link + prune neighbors of each chosen.
 		for _, c := range chosen {
-			if err := s.linkAndPruneTx(tx, tenant, c.id, nodeID, vec, ℓ, mTarget); err != nil {
+			if err := s.linkAndPruneTx(ctx, tx, tenant, c.id, nodeID, vec, ℓ, mTarget); err != nil {
 				return err
 			}
 		}
 
-		// Carry the search frontier forward as entry points for the next layer.
 		entryPoints = W
 	}
 
-	if err := writeHNSWRecord(tx, tenant, &rec); err != nil {
+	if err := writeHNSWRecordTx(ctx, tx, tenant, &rec); err != nil {
 		return err
 	}
 
-	// Phase 3 — extend top.
 	if L > meta.MaxLayer {
 		meta.MaxLayer = L
 		meta.EntryPoint = nodeID
 	}
 	meta.Size++
-	return writeHNSWMeta(tx, tenant, &meta)
+	return writeHNSWMetaTx(ctx, tx, tenant, &meta)
 }
 
 // emptyNeighbors returns Neighbors map with empty slices for layers 0..topLayer.
@@ -259,8 +233,8 @@ func emptyNeighbors(topLayer int) map[int][]string {
 
 // linkAndPruneTx adds nodeID to neighbor n's neighbor list at layer ℓ,
 // then prunes n's neighbors to mTarget if necessary using the heuristic.
-func (s *Storage) linkAndPruneTx(tx *bbolt.Tx, tenant, n, nodeID string, nodeVec []float32, ℓ, mTarget int) error {
-	rec, ok, err := readHNSWRecord(tx, tenant, n)
+func (s *Storage) linkAndPruneTx(ctx context.Context, tx *sql.Tx, tenant, n, nodeID string, nodeVec []float32, ℓ, mTarget int) error {
+	rec, ok, err := readHNSWRecordTx(ctx, tx, tenant, n)
 	if err != nil {
 		return err
 	}
@@ -274,18 +248,14 @@ func (s *Storage) linkAndPruneTx(tx *bbolt.Tx, tenant, n, nodeID string, nodeVec
 		rec.Neighbors[ℓ] = append(rec.Neighbors[ℓ], nodeID)
 	}
 	if len(rec.Neighbors[ℓ]) > mTarget {
-		// Need n's vector to compute distances during pruning.
 		nVec := make([]float32, s.dim)
-		ok, err := readVectorTx(tx, tenant, n, s.dim, nVec)
+		ok, err := readVectorTx(ctx, tx, tenant, n, s.dim, nVec)
 		if err != nil {
 			return err
 		}
 		if !ok {
 			return fmt.Errorf("hnsw: vector for neighbor %q missing during prune", n)
 		}
-		// Build candidate list from current neighbors. Each candidate
-		// carries its vector so the heuristic can compute pairwise
-		// distances during the diversity check.
 		cands := make([]candidate, 0, len(rec.Neighbors[ℓ]))
 		buf := make([]float32, s.dim)
 		for _, id := range rec.Neighbors[ℓ] {
@@ -293,12 +263,12 @@ func (s *Storage) linkAndPruneTx(tx *bbolt.Tx, tenant, n, nodeID string, nodeVec
 			if id == nodeID {
 				v = nodeVec
 			} else {
-				ok, err := readVectorTx(tx, tenant, id, s.dim, buf)
+				ok, err := readVectorTx(ctx, tx, tenant, id, s.dim, buf)
 				if err != nil {
 					return err
 				}
 				if !ok {
-					continue // missing neighbor vector — drop
+					continue
 				}
 				v = make([]float32, s.dim)
 				copy(v, buf)
@@ -312,39 +282,37 @@ func (s *Storage) linkAndPruneTx(tx *bbolt.Tx, tenant, n, nodeID string, nodeVec
 		}
 		rec.Neighbors[ℓ] = ids
 	}
-	return writeHNSWRecord(tx, tenant, &rec)
+	return writeHNSWRecordTx(ctx, tx, tenant, &rec)
 }
 
 // ----- HNSW search (Malkov §4 Alg.5) -----
 
 // hnswSearchTx returns the top-n similarity hits using HNSW navigation.
-// The vector is normalized; meta is fetched fresh from the backend.
-func (s *Storage) hnswSearchTx(tx *bbolt.Tx, tenant string, meta *types.HNSWMeta, q []float32, n int) []vidx.Hit {
+func (s *Storage) hnswSearchTx(ctx context.Context, tx *sql.Tx, tenant string, meta *types.HNSWMeta, q []float32, n int) []vidx.Hit {
 	if meta.Size == 0 || meta.EntryPoint == "" {
 		return nil
 	}
 	cur := meta.EntryPoint
-	curDist, err := s.distTo(tx, tenant, cur, q)
+	curDist, err := s.distToTx(ctx, tx, tenant, cur, q)
 	if err != nil {
 		return nil
 	}
 	for ℓ := meta.MaxLayer; ℓ > 0; ℓ-- {
 		var newCur string
-		newCur, curDist, err = s.greedyDescentTx(tx, tenant, cur, curDist, q, ℓ)
+		newCur, curDist, err = s.greedyDescentTx(ctx, tx, tenant, cur, curDist, q, ℓ)
 		if err != nil {
 			return nil
 		}
 		cur = newCur
 	}
 	ef := max(meta.EfSearch, n)
-	W, err := s.searchLayerTx(tx, tenant, q, []candidate{{id: cur, dist: curDist}}, ef, 0)
+	W, err := s.searchLayerTx(ctx, tx, tenant, q, []candidate{{id: cur, dist: curDist}}, ef, 0)
 	if err != nil {
 		return nil
 	}
 	if n > len(W) {
 		n = len(W)
 	}
-	// Already distance-ascending; convert to similarity-descending hits.
 	hits := make([]vidx.Hit, n)
 	for i := 0; i < n; i++ {
 		hits[i] = vidx.Hit{NodeID: W[i].id, Sim: 1 - W[i].dist}
@@ -352,11 +320,11 @@ func (s *Storage) hnswSearchTx(tx *bbolt.Tx, tenant string, meta *types.HNSWMeta
 	return hits
 }
 
-// greedyDescentTx walks the layer from cur, replacing it with any neighbor
-// strictly closer to q. Returns the local optimum.
-func (s *Storage) greedyDescentTx(tx *bbolt.Tx, tenant, cur string, curDist float64, q []float32, ℓ int) (string, float64, error) {
+// greedyDescentTx walks the layer from cur, replacing it with any
+// neighbor strictly closer to q. Returns the local optimum.
+func (s *Storage) greedyDescentTx(ctx context.Context, tx *sql.Tx, tenant, cur string, curDist float64, q []float32, ℓ int) (string, float64, error) {
 	for {
-		rec, ok, err := readHNSWRecord(tx, tenant, cur)
+		rec, ok, err := readHNSWRecordTx(ctx, tx, tenant, cur)
 		if err != nil {
 			return cur, curDist, err
 		}
@@ -371,7 +339,7 @@ func (s *Storage) greedyDescentTx(tx *bbolt.Tx, tenant, cur string, curDist floa
 		bestDist := curDist
 		buf := make([]float32, s.dim)
 		for _, id := range nbrs {
-			ok, err := readVectorTx(tx, tenant, id, s.dim, buf)
+			ok, err := readVectorTx(ctx, tx, tenant, id, s.dim, buf)
 			if err != nil {
 				return cur, curDist, err
 			}
@@ -390,15 +358,15 @@ func (s *Storage) greedyDescentTx(tx *bbolt.Tx, tenant, cur string, curDist floa
 	}
 }
 
-// searchLayerTx returns up to ef closest nodes to q at layer ℓ, starting
-// from the given entry-point candidates.
-func (s *Storage) searchLayerTx(tx *bbolt.Tx, tenant string, q []float32, eps []candidate, ef, ℓ int) ([]candidate, error) {
+// searchLayerTx returns up to ef closest nodes to q at layer ℓ,
+// starting from the given entry-point candidates.
+func (s *Storage) searchLayerTx(ctx context.Context, tx *sql.Tx, tenant string, q []float32, eps []candidate, ef, ℓ int) ([]candidate, error) {
 	if ef < 1 {
 		ef = 1
 	}
 	visited := make(map[string]struct{}, ef*4)
-	candidatesPQ := newCandMinPQ() // closest first
-	resultsPQ := newCandMaxPQ(ef)  // furthest at root, bounded
+	candidatesPQ := newCandMinPQ()
+	resultsPQ := newCandMaxPQ(ef)
 	for _, ep := range eps {
 		if _, seen := visited[ep.id]; seen {
 			continue
@@ -411,12 +379,10 @@ func (s *Storage) searchLayerTx(tx *bbolt.Tx, tenant string, q []float32, eps []
 	buf := make([]float32, s.dim)
 	for candidatesPQ.len() > 0 {
 		c := candidatesPQ.pop()
-		// If the closest unexplored candidate is further than the worst
-		// kept result and we already have ef results, stop.
 		if resultsPQ.len() >= ef && c.dist > resultsPQ.worst().dist {
 			break
 		}
-		rec, ok, err := readHNSWRecord(tx, tenant, c.id)
+		rec, ok, err := readHNSWRecordTx(ctx, tx, tenant, c.id)
 		if err != nil {
 			return nil, err
 		}
@@ -428,7 +394,7 @@ func (s *Storage) searchLayerTx(tx *bbolt.Tx, tenant string, q []float32, eps []
 				continue
 			}
 			visited[id] = struct{}{}
-			ok, err := readVectorTx(tx, tenant, id, s.dim, buf)
+			ok, err := readVectorTx(ctx, tx, tenant, id, s.dim, buf)
 			if err != nil {
 				return nil, err
 			}
@@ -445,15 +411,13 @@ func (s *Storage) searchLayerTx(tx *bbolt.Tx, tenant string, q []float32, eps []
 			}
 		}
 	}
-	out := resultsPQ.sortedAsc()
-	return out, nil
+	return resultsPQ.sortedAsc(), nil
 }
 
-// distTo computes 1 - dot(q, vec(node)) and returns +Inf when the vector
-// is missing (callers should treat as unreachable rather than failing).
-func (s *Storage) distTo(tx *bbolt.Tx, tenant, nodeID string, q []float32) (float64, error) {
+// distToTx computes 1 - dot(q, vec(node)).
+func (s *Storage) distToTx(ctx context.Context, tx *sql.Tx, tenant, nodeID string, q []float32) (float64, error) {
 	buf := make([]float32, s.dim)
-	ok, err := readVectorTx(tx, tenant, nodeID, s.dim, buf)
+	ok, err := readVectorTx(ctx, tx, tenant, nodeID, s.dim, buf)
 	if err != nil {
 		return 0, err
 	}
@@ -465,49 +429,47 @@ func (s *Storage) distTo(tx *bbolt.Tx, tenant, nodeID string, q []float32) (floa
 
 // ----- HNSW delete -----
 
-// hnswDeleteTx removes nodeID from the HNSW graph: cleans neighbor lists,
-// deletes the record, picks a new entry point if needed.
-func (s *Storage) hnswDeleteTx(tx *bbolt.Tx, tenant, nodeID string) error {
-	meta, found, err := readHNSWMeta(tx, tenant)
+func (s *Storage) hnswDeleteTx(ctx context.Context, tx *sql.Tx, tenant, nodeID string) error {
+	meta, found, err := readHNSWMetaTx(ctx, tx, tenant)
 	if err != nil {
 		return err
 	}
 	if !found || meta.Size == 0 {
 		return nil
 	}
-	rec, ok, err := readHNSWRecord(tx, tenant, nodeID)
+	rec, ok, err := readHNSWRecordTx(ctx, tx, tenant, nodeID)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return nil
 	}
-	if err := s.hnswDetachTx(tx, tenant, &meta, rec); err != nil {
+	if err := s.hnswDetachTx(ctx, tx, tenant, &meta, rec); err != nil {
 		return err
 	}
-	if err := deleteHNSWRecord(tx, tenant, nodeID); err != nil {
+	if err := deleteHNSWRecordTx(ctx, tx, tenant, nodeID); err != nil {
 		return err
 	}
 	meta.Size--
 	if meta.Size == 0 {
 		meta.EntryPoint = ""
 		meta.MaxLayer = 0
-		return writeHNSWMeta(tx, tenant, &meta)
+		return writeHNSWMetaTx(ctx, tx, tenant, &meta)
 	}
 	if meta.EntryPoint == nodeID {
-		newEP, newLayer, err := pickEntryPoint(tx, tenant)
+		newEP, newLayer, err := pickEntryPointTx(ctx, tx, tenant)
 		if err != nil {
 			return err
 		}
 		meta.EntryPoint = newEP
 		meta.MaxLayer = newLayer
 	}
-	return writeHNSWMeta(tx, tenant, &meta)
+	return writeHNSWMetaTx(ctx, tx, tenant, &meta)
 }
 
-// hnswDetachTx removes nodeID from every neighbor's neighbor list across
-// all layers. It does NOT delete the node's own HNSW record (caller does).
-func (s *Storage) hnswDetachTx(tx *bbolt.Tx, tenant string, _ *types.HNSWMeta, rec types.HNSWRecord) error {
+// hnswDetachTx removes nodeID from every neighbor's neighbor list
+// across all layers.
+func (s *Storage) hnswDetachTx(ctx context.Context, tx *sql.Tx, tenant string, _ *types.HNSWMeta, rec types.HNSWRecord) error {
 	touched := make(map[string]struct{})
 	for _, nbrs := range rec.Neighbors {
 		for _, n := range nbrs {
@@ -515,7 +477,7 @@ func (s *Storage) hnswDetachTx(tx *bbolt.Tx, tenant string, _ *types.HNSWMeta, r
 		}
 	}
 	for n := range touched {
-		nrec, ok, err := readHNSWRecord(tx, tenant, n)
+		nrec, ok, err := readHNSWRecordTx(ctx, tx, tenant, n)
 		if err != nil {
 			return err
 		}
@@ -535,7 +497,7 @@ func (s *Storage) hnswDetachTx(tx *bbolt.Tx, tenant string, _ *types.HNSWMeta, r
 			nrec.Neighbors[ℓ] = filtered
 		}
 		if changed {
-			if err := writeHNSWRecord(tx, tenant, &nrec); err != nil {
+			if err := writeHNSWRecordTx(ctx, tx, tenant, &nrec); err != nil {
 				return err
 			}
 		}
@@ -543,26 +505,32 @@ func (s *Storage) hnswDetachTx(tx *bbolt.Tx, tenant string, _ *types.HNSWMeta, r
 	return nil
 }
 
-// pickEntryPoint scans hnsw_records and returns an ID at the highest
-// remaining layer. If the bucket is empty, returns ("", 0, nil).
-func pickEntryPoint(tx *bbolt.Tx, tenant string) (string, int, error) {
-	rb, err := hnswRecords(tx, tenant, false)
-	if err != nil || rb == nil {
+// pickEntryPointTx scans hnsw_records for the tenant and returns an ID
+// at the highest remaining layer.
+func pickEntryPointTx(ctx context.Context, tx *sql.Tx, tenant string) (string, int, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT node_id, blob FROM hnsw_records WHERE tenant = ?`, tenant)
+	if err != nil {
 		return "", 0, err
 	}
+	defer rows.Close()
 	bestLayer := -1
 	var bestID string
-	if err := rb.ForEach(func(k, v []byte) error {
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			return "", 0, err
+		}
 		var r types.HNSWRecord
-		if err := decodeHNSWRecord(v, &r); err != nil {
-			return err
+		if err := decodeHNSWRecord(raw, &r); err != nil {
+			return "", 0, err
 		}
 		if r.Layer > bestLayer {
 			bestLayer = r.Layer
-			bestID = string(k)
+			bestID = id
 		}
-		return nil
-	}); err != nil {
+	}
+	if err := rows.Err(); err != nil {
 		return "", 0, err
 	}
 	if bestLayer < 0 {
@@ -583,12 +551,11 @@ type candidate struct {
 	vec  []float32
 }
 
-// candMinPQ pops the candidate with the smallest distance.
 type candMinPQ struct{ data []candidate }
 
 func newCandMinPQ() *candMinPQ { return &candMinPQ{} }
 
-func (h *candMinPQ) len() int    { return len(h.data) }
+func (h *candMinPQ) len() int { return len(h.data) }
 func (h *candMinPQ) push(c candidate) {
 	h.data = append(h.data, c)
 	h.siftUp(len(h.data) - 1)
@@ -632,8 +599,7 @@ func (h *candMinPQ) siftDown(i int) {
 	}
 }
 
-// candMaxPQ pops the candidate with the largest distance. Bounded; pushing
-// past cap evicts the largest after insertion to keep the cap.
+// candMaxPQ pops the candidate with the largest distance.
 type candMaxPQ struct {
 	data []candidate
 	cap  int
@@ -645,7 +611,7 @@ func (h *candMaxPQ) len() int { return len(h.data) }
 func (h *candMaxPQ) push(c candidate) {
 	if h.cap > 0 && len(h.data) >= h.cap {
 		if c.dist >= h.data[0].dist {
-			return // worse than worst-kept; skip
+			return
 		}
 		h.data[0] = c
 		h.siftDownMax(0)
@@ -692,23 +658,9 @@ func (h *candMaxPQ) siftDownMax(i int) {
 	}
 }
 
-// ----- neighbor-selection heuristic (Malkov §4 Alg.4) -----
-
 // selectNeighborsHeuristic picks up to m candidates that are diverse
-// with respect to the implicit query point q (whatever the candidates'
-// dist field measures distance to). Implements Algorithm 4 of Malkov
-// & Yashunin (2018) with extendCandidates=false and
-// keepPrunedConnections=true.
-//
-// Pull candidates closest-to-q first. Admit c iff for every already-
-// chosen r, c is closer to q than to r — i.e., dist(c, q) < dist(c, r).
-// Otherwise hold c in the discarded set. Once the main loop finishes,
-// fill any remaining slots from the discarded set in dist-to-q order so
-// we always return min(|W|, m) candidates.
-//
-// Each candidate must carry vec; callers that lack vectors get the
-// same closest-first behavior as before since the diversity check
-// silently degrades (no veci → no rejection).
+// w.r.t. the implicit query point q. Implements Malkov & Yashunin (2018)
+// Algorithm 4 with extendCandidates=false and keepPrunedConnections=true.
 func selectNeighborsHeuristic(W []candidate, m int) []candidate {
 	if m <= 0 || len(W) == 0 {
 		return nil
@@ -748,8 +700,6 @@ func selectNeighborsHeuristic(W []candidate, m int) []candidate {
 			discarded = append(discarded, c)
 		}
 	}
-	// keepPrunedConnections — fill remaining slots with the closest of
-	// the discarded set (already in dist-ascending order).
 	for _, d := range discarded {
 		if len(chosen) >= m {
 			break
@@ -759,10 +709,4 @@ func selectNeighborsHeuristic(W []candidate, m int) []candidate {
 	return chosen
 }
 
-// ----- helpers -----
-
 func contains(s []string, v string) bool { return slices.Contains(s, v) }
-
-// ErrHNSWMissingVector is returned when an HNSW operation requires a
-// vector that is not present (corruption or partial delete).
-var ErrHNSWMissingVector = errors.New("hnsw: vector missing")

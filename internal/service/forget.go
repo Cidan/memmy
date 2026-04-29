@@ -114,9 +114,9 @@ func orderedPair(a, b string) [2]string {
 }
 
 // nodesForMessage returns all nodes derived from a given message ID. We
-// look this up by scanning the tenant's nodes; bbolt backend exposes a
-// helper for it. Backends may implement messageNodeScanner for an
-// efficient query path.
+// look this up by scanning the tenant's nodes; the SQLite backend
+// exposes a helper for it. Backends may implement messageNodeScanner
+// for an efficient query path.
 func (s *Service) nodesForMessage(ctx context.Context, tenant, msgID string) ([]types.Node, error) {
 	if scanner, ok := s.graph.(messageNodeScanner); ok {
 		return scanner.NodesForMessage(ctx, tenant, msgID)

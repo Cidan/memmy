@@ -1,23 +1,24 @@
-package bboltstore_test
+package sqlitestore_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"math/rand/v2"
 	"testing"
 	"time"
 
-	"go.etcd.io/bbolt"
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/Cidan/memmy/internal/service"
-	bboltstore "github.com/Cidan/memmy/internal/storage/bbolt"
+	sqlitestore "github.com/Cidan/memmy/internal/storage/sqlite"
 	"github.com/Cidan/memmy/internal/types"
 )
 
 // TestCounters_MatchBruteForce exercises a randomized mix of node and
 // edge mutations (insert / replace / weight-update / delete) and after
 // each batch asserts that the O(1) per-tenant counter equals the
-// counts and weight sums computed via a fresh full-bucket walk.
+// counts and weight sums computed via a fresh full-table walk.
 func TestCounters_MatchBruteForce(t *testing.T) {
 	st := openTestStorage(t, 8)
 	g := st.Graph()
@@ -25,8 +26,6 @@ func TestCounters_MatchBruteForce(t *testing.T) {
 	tenant := "t"
 	r := rand.New(rand.NewPCG(20260427, 7))
 
-	// Track an in-memory shadow so the brute-force reconciliation has a
-	// straightforward expected state.
 	type nodeShadow struct {
 		ID     string
 		Weight float64
@@ -82,8 +81,6 @@ func TestCounters_MatchBruteForce(t *testing.T) {
 				t.Fatalf("DeleteNode: %v", err)
 			}
 			delete(nodes, id)
-			// Adjacent edges remain in the bucket — Graph does NOT cascade.
-			// The shadow must mirror that exact behavior.
 
 		case 4, 5: // PutEdge (new or replace)
 			if len(nodes) < 2 {
@@ -128,7 +125,6 @@ func TestCounters_MatchBruteForce(t *testing.T) {
 		}
 	}
 
-	// Brute-force expected from the shadow.
 	var expected service.TenantStats
 	expected.NodeCount = len(nodes)
 	expected.EdgeCount = len(edges)
@@ -139,23 +135,20 @@ func TestCounters_MatchBruteForce(t *testing.T) {
 		expected.SumEdgeWeight += e.Weight
 	}
 
-	// Walk the bbolt buckets directly as a second oracle (catches drift
-	// between shadow and what's actually persisted).
-	bucketWalk := walkBucketStats(t, st, tenant)
-	if bucketWalk.NodeCount != expected.NodeCount {
-		t.Fatalf("bucket NodeCount=%d, shadow=%d", bucketWalk.NodeCount, expected.NodeCount)
+	tableWalk := walkTableStats(t, st, tenant)
+	if tableWalk.NodeCount != expected.NodeCount {
+		t.Fatalf("table NodeCount=%d, shadow=%d", tableWalk.NodeCount, expected.NodeCount)
 	}
-	if bucketWalk.EdgeCount != expected.EdgeCount {
-		t.Fatalf("bucket EdgeCount=%d, shadow=%d", bucketWalk.EdgeCount, expected.EdgeCount)
+	if tableWalk.EdgeCount != expected.EdgeCount {
+		t.Fatalf("table EdgeCount=%d, shadow=%d", tableWalk.EdgeCount, expected.EdgeCount)
 	}
-	if !nearlyEqual(bucketWalk.SumNodeWeight, expected.SumNodeWeight) {
-		t.Fatalf("bucket SumNodeWeight=%v, shadow=%v", bucketWalk.SumNodeWeight, expected.SumNodeWeight)
+	if !nearlyEqual(tableWalk.SumNodeWeight, expected.SumNodeWeight) {
+		t.Fatalf("table SumNodeWeight=%v, shadow=%v", tableWalk.SumNodeWeight, expected.SumNodeWeight)
 	}
-	if !nearlyEqual(bucketWalk.SumEdgeWeight, expected.SumEdgeWeight) {
-		t.Fatalf("bucket SumEdgeWeight=%v, shadow=%v", bucketWalk.SumEdgeWeight, expected.SumEdgeWeight)
+	if !nearlyEqual(tableWalk.SumEdgeWeight, expected.SumEdgeWeight) {
+		t.Fatalf("table SumEdgeWeight=%v, shadow=%v", tableWalk.SumEdgeWeight, expected.SumEdgeWeight)
 	}
 
-	// Now the counter-backed Stats must match.
 	scanner, ok := g.(interface {
 		TenantStats(ctx context.Context, tenant string) (service.TenantStats, error)
 	})
@@ -207,8 +200,6 @@ func TestCounters_DeleteNonexistent(t *testing.T) {
 	}
 }
 
-// pickRandKey returns a uniformly random key from a map (deterministic
-// per the supplied rand).
 func pickRandKey[T any](r *rand.Rand, m map[string]T) string {
 	if len(m) == 0 {
 		return ""
@@ -224,58 +215,58 @@ func pickRandKey[T any](r *rand.Rand, m map[string]T) string {
 	return ""
 }
 
-// walkBucketStats opens a fresh read tx and walks the nodes + outbound-
-// edges buckets, computing counts and weight sums. This is the
-// independent oracle the counter test reconciles against.
-func walkBucketStats(t *testing.T, st bboltDB, tenant string) service.TenantStats {
+// walkTableStats opens a fresh sql.DB at the same path and walks the
+// nodes + edges_out tables, computing counts and weight sums. This is
+// the independent oracle the counter test reconciles against.
+func walkTableStats(t *testing.T, st *sqlitestore.Storage, tenant string) service.TenantStats {
 	t.Helper()
-	var ts service.TenantStats
-	err := st.Raw().View(func(tx *bbolt.Tx) error {
-		root := tx.Bucket([]byte("t"))
-		if root == nil {
-			return nil
-		}
-		tb := root.Bucket([]byte(tenant))
-		if tb == nil {
-			return nil
-		}
-		if nb := tb.Bucket([]byte("nodes")); nb != nil {
-			if err := nb.ForEach(func(_, v []byte) error {
-				var n types.Node
-				if err := bboltstore.DecodeNodeForTest(v, &n); err != nil {
-					return err
-				}
-				ts.NodeCount++
-				ts.SumNodeWeight += n.Weight
-				return nil
-			}); err != nil {
-				return err
-			}
-		}
-		if eo := tb.Bucket([]byte("eout")); eo != nil {
-			return eo.ForEachBucket(func(k []byte) error {
-				return eo.Bucket(k).ForEach(func(_, v []byte) error {
-					var e types.MemoryEdge
-					if err := bboltstore.DecodeEdgeForTest(v, &e); err != nil {
-						return err
-					}
-					ts.EdgeCount++
-					ts.SumEdgeWeight += e.Weight
-					return nil
-				})
-			})
-		}
-		return nil
-	})
+	probe, err := sql.Open("sqlite3", "file:"+st.Path()+"?_journal_mode=WAL")
 	if err != nil {
-		t.Fatalf("walk: %v", err)
+		t.Fatalf("probe open: %v", err)
 	}
-	return ts
-}
+	defer probe.Close()
 
-// bboltDB is the small contract walkBucketStats needs from Storage.
-type bboltDB interface {
-	Raw() *bbolt.DB
+	var ts service.TenantStats
+	rows, err := probe.Query(`SELECT blob FROM nodes WHERE tenant = ?`, tenant)
+	if err != nil {
+		t.Fatalf("nodes query: %v", err)
+	}
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		var n types.Node
+		if err := sqlitestore.DecodeNodeForTest(raw, &n); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		ts.NodeCount++
+		ts.SumNodeWeight += n.Weight
+	}
+	rows.Close()
+
+	rows, err = probe.Query(`SELECT blob FROM edges_out WHERE tenant = ?`, tenant)
+	if err != nil {
+		t.Fatalf("edges_out query: %v", err)
+	}
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		var e types.MemoryEdge
+		if err := sqlitestore.DecodeEdgeForTest(raw, &e); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		ts.EdgeCount++
+		ts.SumEdgeWeight += e.Weight
+	}
+	rows.Close()
+	return ts
 }
 
 func nearlyEqual(a, b float64) bool {
@@ -285,4 +276,3 @@ func nearlyEqual(a, b float64) bool {
 	}
 	return d < 1e-6
 }
-

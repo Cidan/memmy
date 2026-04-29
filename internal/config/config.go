@@ -63,12 +63,15 @@ type TransportConfig struct {
 }
 
 type StorageConfig struct {
-	Backend string             `yaml:"backend"`
-	BBolt   BBoltStorageConfig `yaml:"bbolt"`
+	Backend string              `yaml:"backend"`
+	SQLite  SQLiteStorageConfig `yaml:"sqlite"`
 }
 
-type BBoltStorageConfig struct {
+type SQLiteStorageConfig struct {
 	Path string `yaml:"path"`
+	// BusyTimeout caps how long a blocked SQLite writer waits for the
+	// reserved lock before failing with SQLITE_BUSY. 0 → 5 seconds default.
+	BusyTimeout time.Duration `yaml:"busy_timeout"`
 }
 
 type EmbedderConfig struct {
@@ -169,8 +172,8 @@ func Default() Config {
 			Transports: map[string]TransportConfig{},
 		},
 		Storage: StorageConfig{
-			Backend: "bbolt",
-			BBolt:   BBoltStorageConfig{Path: "./data/memmy.db"},
+			Backend: "sqlite",
+			SQLite:  SQLiteStorageConfig{Path: "./data/memmy.db"},
 		},
 		Embedder: EmbedderConfig{
 			Backend: "fake",
@@ -252,11 +255,11 @@ func Load(path string) (Config, error) {
 // Validate reports an error if any required field is missing or any
 // numeric tunable is outside a sane range.
 func (c Config) Validate() error {
-	if c.Storage.Backend != "bbolt" {
-		return fmt.Errorf("config: unsupported storage backend %q (only bbolt for v1)", c.Storage.Backend)
+	if c.Storage.Backend != "sqlite" {
+		return fmt.Errorf("config: unsupported storage backend %q (only sqlite for v1)", c.Storage.Backend)
 	}
-	if c.Storage.BBolt.Path == "" {
-		return errors.New("config: storage.bbolt.path required")
+	if c.Storage.SQLite.Path == "" {
+		return errors.New("config: storage.sqlite.path required")
 	}
 	switch c.Embedder.Backend {
 	case "gemini":

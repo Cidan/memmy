@@ -25,7 +25,7 @@ import (
 	"github.com/Cidan/memmy/internal/embed/fake"
 	"github.com/Cidan/memmy/internal/embed/gemini"
 	"github.com/Cidan/memmy/internal/service"
-	bboltstore "github.com/Cidan/memmy/internal/storage/bbolt"
+	sqlitestore "github.com/Cidan/memmy/internal/storage/sqlite"
 	mcpadapter "github.com/Cidan/memmy/internal/transport/mcp"
 )
 
@@ -135,13 +135,13 @@ func run() error {
 
 // ----- storage -----
 
-func openStorage(cfg config.Config) (*bboltstore.Storage, error) {
+func openStorage(cfg config.Config) (*sqlitestore.Storage, error) {
 	switch cfg.Storage.Backend {
-	case "bbolt":
-		return bboltstore.Open(bboltstore.Options{
-			Path: cfg.Storage.BBolt.Path,
+	case "sqlite":
+		return sqlitestore.Open(sqlitestore.Options{
+			Path: cfg.Storage.SQLite.Path,
 			Dim:  cfg.EmbedderDim(),
-			HNSW: bboltstore.HNSWConfig{
+			HNSW: sqlitestore.HNSWConfig{
 				M:              cfg.VectorIndex.HNSW.M,
 				M0:             cfg.VectorIndex.HNSW.M0,
 				EfConstruction: cfg.VectorIndex.HNSW.EfConstruction,
@@ -149,7 +149,10 @@ func openStorage(cfg config.Config) (*bboltstore.Storage, error) {
 				ML:             cfg.VectorIndex.HNSW.ML,
 			},
 			FlatScanThreshold: cfg.VectorIndex.FlatScanThreshold,
+			BusyTimeout:       cfg.Storage.SQLite.BusyTimeout,
 		})
+	case "bbolt":
+		return nil, fmt.Errorf("storage backend %q has been removed; switch storage.backend to %q (memories must be re-written — there is no migration path)", "bbolt", "sqlite")
 	default:
 		return nil, fmt.Errorf("unsupported storage backend %q", cfg.Storage.Backend)
 	}

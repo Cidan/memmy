@@ -19,8 +19,8 @@ server:
       enabled: true
       addr: "127.0.0.1:9999"
 storage:
-  backend: bbolt
-  bbolt:
+  backend: sqlite
+  sqlite:
     path: "/tmp/memmy.db"
 embedder:
   backend: fake
@@ -41,8 +41,8 @@ memory:
 	if cfg.Server.Transports["mcp"].Addr != "127.0.0.1:9999" {
 		t.Fatalf("addr=%q", cfg.Server.Transports["mcp"].Addr)
 	}
-	if cfg.Storage.BBolt.Path != "/tmp/memmy.db" {
-		t.Fatalf("path=%q", cfg.Storage.BBolt.Path)
+	if cfg.Storage.SQLite.Path != "/tmp/memmy.db" {
+		t.Fatalf("path=%q", cfg.Storage.SQLite.Path)
 	}
 	if cfg.Embedder.Backend != "fake" || cfg.EmbedderDim() != 32 {
 		t.Fatalf("embedder %+v", cfg.Embedder)
@@ -179,8 +179,8 @@ server:
     stdio:
       enabled: true
 storage:
-  backend: bbolt
-  bbolt:
+  backend: sqlite
+  sqlite:
     path: "/tmp/memmy.db"
 embedder:
   backend: fake
@@ -280,8 +280,8 @@ func TestConfig_LoadOmittedServerSectionFails(t *testing.T) {
 	path := filepath.Join(dir, "memmy.yaml")
 	contents := `
 storage:
-  backend: bbolt
-  bbolt:
+  backend: sqlite
+  sqlite:
     path: "/tmp/memmy.db"
 embedder:
   backend: fake

@@ -1,18 +1,18 @@
-package bboltstore
+package sqlitestore
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
 	"sort"
 
-	"go.etcd.io/bbolt"
-
 	vidx "github.com/Cidan/memmy/internal/vectorindex"
 )
 
-// vectorAdapter exposes Storage as the vectorindex.VectorIndex interface.
+// vectorAdapter exposes Storage as the vectorindex.VectorIndex
+// interface.
 type vectorAdapter struct{ s *Storage }
 
 // VectorIndex returns the VectorIndex view over this Storage.
@@ -24,7 +24,7 @@ func (a vectorAdapter) Close() error { return a.s.Close() }
 
 // Insert adds (or replaces) the vector for nodeID and its HNSW record.
 // All writes commit in a single transaction.
-func (a vectorAdapter) Insert(_ context.Context, tenant, nodeID string, vec []float32) error {
+func (a vectorAdapter) Insert(ctx context.Context, tenant, nodeID string, vec []float32) error {
 	if tenant == "" {
 		return errors.New("vectorindex: tenant required")
 	}
@@ -35,30 +35,30 @@ func (a vectorAdapter) Insert(_ context.Context, tenant, nodeID string, vec []fl
 		return fmt.Errorf("vectorindex: vector dim=%d, want %d", len(vec), a.s.dim)
 	}
 	norm := l2Normalize(vec)
-	return a.s.db.Update(func(tx *bbolt.Tx) error {
-		if err := putVectorTx(tx, tenant, nodeID, norm); err != nil {
+	return a.s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if err := putVectorTx(ctx, tx, tenant, nodeID, norm); err != nil {
 			return err
 		}
-		return a.s.hnswInsertTx(tx, tenant, nodeID, norm)
+		return a.s.hnswInsertTx(ctx, tx, tenant, nodeID, norm)
 	})
 }
 
 // Delete hard-removes the vector and HNSW record for nodeID and repairs
 // neighbor lists. If nodeID was the HNSW entry point, a new entry point
 // is chosen.
-func (a vectorAdapter) Delete(_ context.Context, tenant, nodeID string) error {
-	return a.s.db.Update(func(tx *bbolt.Tx) error {
-		if err := a.s.hnswDeleteTx(tx, tenant, nodeID); err != nil {
+func (a vectorAdapter) Delete(ctx context.Context, tenant, nodeID string) error {
+	return a.s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if err := a.s.hnswDeleteTx(ctx, tx, tenant, nodeID); err != nil {
 			return err
 		}
-		return deleteVectorTx(tx, tenant, nodeID)
+		return deleteVectorTx(ctx, tx, tenant, nodeID)
 	})
 }
 
-func (a vectorAdapter) Size(_ context.Context, tenant string) (int, error) {
+func (a vectorAdapter) Size(ctx context.Context, tenant string) (int, error) {
 	var size int
-	err := a.s.db.View(func(tx *bbolt.Tx) error {
-		meta, ok, err := readHNSWMeta(tx, tenant)
+	err := a.s.withReadTx(ctx, func(tx *sql.Tx) error {
+		meta, ok, err := readHNSWMetaTx(ctx, tx, tenant)
 		if err != nil || !ok {
 			return err
 		}
@@ -69,7 +69,7 @@ func (a vectorAdapter) Size(_ context.Context, tenant string) (int, error) {
 }
 
 // Search runs flat scan when tenant size is below the threshold, else HNSW.
-func (a vectorAdapter) Search(_ context.Context, tenant string, qVec []float32, n int) ([]vidx.Hit, error) {
+func (a vectorAdapter) Search(ctx context.Context, tenant string, qVec []float32, n int) ([]vidx.Hit, error) {
 	if len(qVec) != a.s.dim {
 		return nil, fmt.Errorf("vectorindex: query dim=%d, want %d", len(qVec), a.s.dim)
 	}
@@ -78,8 +78,8 @@ func (a vectorAdapter) Search(_ context.Context, tenant string, qVec []float32, 
 	}
 	qNorm := l2Normalize(qVec)
 	var hits []vidx.Hit
-	err := a.s.db.View(func(tx *bbolt.Tx) error {
-		meta, ok, err := readHNSWMeta(tx, tenant)
+	err := a.s.withReadTx(ctx, func(tx *sql.Tx) error {
+		meta, ok, err := readHNSWMetaTx(ctx, tx, tenant)
 		if err != nil {
 			return err
 		}
@@ -87,77 +87,73 @@ func (a vectorAdapter) Search(_ context.Context, tenant string, qVec []float32, 
 			return nil
 		}
 		if meta.Size < a.s.flatScanThreshold {
-			hits = a.flatScanTx(tx, tenant, qNorm, n)
+			h, err := a.flatScanTx(ctx, tx, tenant, qNorm, n)
+			if err != nil {
+				return err
+			}
+			hits = h
 			return nil
 		}
-		hits = a.s.hnswSearchTx(tx, tenant, &meta, qNorm, n)
+		hits = a.s.hnswSearchTx(ctx, tx, tenant, &meta, qNorm, n)
 		return nil
 	})
 	return hits, err
 }
 
-// flatScanTx streams every vector in the tenant via a bbolt cursor and
-// keeps a bounded top-N heap. Memory is O(N), independent of corpus size.
-func (a vectorAdapter) flatScanTx(tx *bbolt.Tx, tenant string, q []float32, n int) []vidx.Hit {
-	vb, err := vecBucket(tx, tenant, false)
-	if err != nil || vb == nil {
-		return nil
-	}
-	heap := newTopNSim(n)
-	buf := make([]float32, a.s.dim)
-	cur := vb.Cursor()
-	for k, v := cur.First(); k != nil; k, v = cur.Next() {
-		if len(v) != a.s.dim*4 {
-			continue
-		}
-		decodeVectorInto(v, buf)
-		s := float64(dot(q, buf))
-		heap.push(string(k), s)
-	}
-	return heap.sorted()
-}
-
-// vecBucket returns the t/<tenant>/vec bucket.
-func vecBucket(tx *bbolt.Tx, tenant string, create bool) (*bbolt.Bucket, error) {
-	t, err := tenantBucket(tx, tenant, create)
+// flatScanTx streams every vector for the tenant and keeps a bounded
+// top-N heap. Memory is O(N + dim), independent of corpus size.
+func (a vectorAdapter) flatScanTx(ctx context.Context, tx *sql.Tx, tenant string, q []float32, n int) ([]vidx.Hit, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT node_id, vec FROM vectors WHERE tenant = ?`, tenant)
 	if err != nil {
 		return nil, err
 	}
-	return subBucket(t, bktVec, create)
+	defer rows.Close()
+	heap := newTopNSim(n)
+	buf := make([]float32, a.s.dim)
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, err
+		}
+		if len(raw) != a.s.dim*4 {
+			continue
+		}
+		decodeVectorInto(raw, buf)
+		s := float64(dot(q, buf))
+		heap.push(id, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return heap.sorted(), nil
 }
 
 // putVectorTx writes raw LE float32 bytes for a vector inside an existing tx.
-func putVectorTx(tx *bbolt.Tx, tenant, nodeID string, normVec []float32) error {
-	vb, err := vecBucket(tx, tenant, true)
-	if err != nil {
-		return err
-	}
-	return vb.Put([]byte(nodeID), encodeVector(normVec))
+func putVectorTx(ctx context.Context, tx *sql.Tx, tenant, nodeID string, normVec []float32) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO vectors(tenant, node_id, vec) VALUES(?, ?, ?)
+		ON CONFLICT(tenant, node_id) DO UPDATE SET vec = excluded.vec
+	`, tenant, nodeID, encodeVector(normVec))
+	return err
 }
 
-func deleteVectorTx(tx *bbolt.Tx, tenant, nodeID string) error {
-	vb, err := vecBucket(tx, tenant, false)
-	if err != nil {
-		return err
-	}
-	if vb == nil {
-		return nil
-	}
-	return vb.Delete([]byte(nodeID))
+func deleteVectorTx(ctx context.Context, tx *sql.Tx, tenant, nodeID string) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM vectors WHERE tenant = ? AND node_id = ?`, tenant, nodeID)
+	return err
 }
 
-// readVectorTx loads a vector by nodeID.
-func readVectorTx(tx *bbolt.Tx, tenant, nodeID string, dim int, out []float32) (bool, error) {
-	vb, err := vecBucket(tx, tenant, false)
+// readVectorTx loads a vector by nodeID into the supplied buffer.
+// out must be pre-sized to dim. Returns (false, nil) when the vector
+// does not exist.
+func readVectorTx(ctx context.Context, tx *sql.Tx, tenant, nodeID string, dim int, out []float32) (bool, error) {
+	var raw []byte
+	err := tx.QueryRowContext(ctx, `SELECT vec FROM vectors WHERE tenant = ? AND node_id = ?`, tenant, nodeID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
-	}
-	if vb == nil {
-		return false, nil
-	}
-	raw := vb.Get([]byte(nodeID))
-	if raw == nil {
-		return false, nil
 	}
 	if len(raw) != dim*4 {
 		return false, fmt.Errorf("vector dim mismatch for %s: have %d bytes, want %d", nodeID, len(raw), dim*4)
@@ -193,10 +189,6 @@ func dot(a, b []float32) float32 {
 }
 
 // ----- top-N similarity heap -----
-//
-// Bounded heap that keeps the top-n elements by similarity (larger = better).
-// Internally a min-heap (root is the smallest sim, which is the eviction
-// candidate when a new better element arrives).
 
 type simEntry struct {
 	id  string
@@ -205,7 +197,7 @@ type simEntry struct {
 
 type topNSim struct {
 	cap  int
-	heap []simEntry // min-heap
+	heap []simEntry // min-heap (root = smallest sim, eviction candidate)
 }
 
 func newTopNSim(cap int) *topNSim { return &topNSim{cap: cap} }

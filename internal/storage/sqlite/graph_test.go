@@ -1,4 +1,4 @@
-package bboltstore_test
+package sqlitestore_test
 
 import (
 	"context"
@@ -113,7 +113,6 @@ func TestGraph_Edge_DualMirrorAtomic(t *testing.T) {
 		t.Fatalf("PutEdge: %v", err)
 	}
 
-	// outbound from "a" sees the edge
 	out, err := g.Neighbors(ctx, tenant, "a")
 	if err != nil {
 		t.Fatal(err)
@@ -122,7 +121,6 @@ func TestGraph_Edge_DualMirrorAtomic(t *testing.T) {
 		t.Fatalf("outbound from a = %+v", out)
 	}
 
-	// inbound to "b" sees the same edge
 	in, err := g.InboundNeighbors(ctx, tenant, "b")
 	if err != nil {
 		t.Fatal(err)
@@ -131,7 +129,6 @@ func TestGraph_Edge_DualMirrorAtomic(t *testing.T) {
 		t.Fatalf("inbound to b = %+v", in)
 	}
 
-	// Update bumps weight in both mirrors atomically.
 	if err := g.UpdateEdge(ctx, tenant, "a", "b", func(e *types.MemoryEdge) error {
 		e.Weight = 5.0
 		e.AccessCount = 3
@@ -148,7 +145,6 @@ func TestGraph_Edge_DualMirrorAtomic(t *testing.T) {
 		t.Fatalf("counts diverged")
 	}
 
-	// Delete removes both mirrors.
 	if err := g.DeleteEdge(ctx, tenant, "a", "b"); err != nil {
 		t.Fatal(err)
 	}
@@ -257,6 +253,9 @@ func TestGraph_Tenants(t *testing.T) {
 	}
 }
 
+// TestGraph_UpdateNode_ClosureErrorAborts asserts that returning a
+// non-nil error from the UpdateNode closure rolls back the underlying
+// SQLite transaction so the previous state is preserved.
 func TestGraph_UpdateNode_ClosureErrorAborts(t *testing.T) {
 	st := openTestStorage(t, 8)
 	g := st.Graph()
@@ -278,5 +277,34 @@ func TestGraph_UpdateNode_ClosureErrorAborts(t *testing.T) {
 	got, _ := g.GetNode(ctx, tenant, "n")
 	if got.Weight != 1.0 {
 		t.Fatalf("closure error did not abort: weight=%v", got.Weight)
+	}
+}
+
+// TestGraph_Edge_UpdateEdge_ClosureErrorAborts confirms the same
+// rollback semantics for UpdateEdge — both edges_out and edges_in
+// must remain at their pre-closure state.
+func TestGraph_Edge_UpdateEdge_ClosureErrorAborts(t *testing.T) {
+	st := openTestStorage(t, 8)
+	g := st.Graph()
+	ctx := context.Background()
+	tenant := "t"
+
+	if err := g.PutEdge(ctx, types.MemoryEdge{
+		From: "a", To: "b", TenantID: tenant, Weight: 1.0, Kind: types.EdgeStructural,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("nope")
+	err := g.UpdateEdge(ctx, tenant, "a", "b", func(e *types.MemoryEdge) error {
+		e.Weight = 999
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want nope", err)
+	}
+	out, _ := g.Neighbors(ctx, tenant, "a")
+	in, _ := g.InboundNeighbors(ctx, tenant, "b")
+	if out[0].Weight != 1.0 || in[0].Weight != 1.0 {
+		t.Fatalf("closure error did not abort: out=%v in=%v", out[0].Weight, in[0].Weight)
 	}
 }

@@ -1,6 +1,6 @@
 # memmy
 
-memmy is an LLM memory system written in pure Go (toolchain Go 1.26.2). It exposes Hebbian-reinforced, decay-aware memory to one or more agents over MCP (with gRPC and HTTP transport adapters reserved for future work). The first reference storage backend is bbolt; the same logical model maps to Postgres, MariaDB, Bigtable, Spanner, and other stores that satisfy the `Graph` and `VectorIndex` interfaces.
+memmy is an LLM memory system written in Go (toolchain Go 1.26.2). It exposes Hebbian-reinforced, decay-aware memory to one or more agents over MCP (with gRPC and HTTP transport adapters reserved for future work). The reference storage backend is SQLite (WAL mode), which lets multiple host processes — daemons, ad-hoc tools, in-process libraries — share one corpus on disk; the same logical model maps to Postgres, MariaDB, Bigtable, Spanner, and other stores that satisfy the `Graph` and `VectorIndex` interfaces. The SQLite driver (`github.com/mattn/go-sqlite3`) is the project's only CGO dependency.
 
 The load-bearing design principle is **one source of truth: the database**. Vectors, the HNSW navigation graph, nodes, messages, and Hebbian memory edges all live in the configured storage backend — there is no in-memory index, no secondary search engine, no parallel cache. memmy itself is **stateless across requests**: only connection pools, configuration, and process-local rate limiters are kept in-memory. This is what lets N memmy instances scale out behind a multi-writer backend without coordination.
 
@@ -79,7 +79,7 @@ Notes:
 
 - **`Embedder` is required and pluggable.** Use `memmy.NewFakeEmbedder(dim)` for tests or supply any type satisfying the `memmy.Embedder` interface.
 - **`TenantSchema` is optional.** Pass `nil` (or call `NewTenantSchema` with an empty `TenantSchemaConfig`) to accept any tuple shape.
-- **`closer.Close()` releases the bbolt file lock.** The embedder's lifecycle is the caller's; `Close` does not touch it.
+- **`closer.Close()` releases the SQLite handles.** Both the writer and reader DB are closed; the WAL file is checkpointed by SQLite on the last connection close. The embedder's lifecycle is the caller's; `Close` does not touch it.
 - **No transports start.** The facade is library-only — to expose `MemoryService` over MCP / HTTP, run `cmd/memmy` with a YAML config instead.
 - **Tunable overrides use a pointer.** `Options.ServiceConfig` and `Options.HNSW` are `*ServiceConfig` and `*HNSWConfig` respectively — `nil` means "use defaults," and any non-nil value is treated as a complete config. To change one knob, start from `memmy.DefaultServiceConfig()` (or `memmy.DefaultHNSWConfig()`), mutate, and pass the address. The facade does not field-merge because some service tunables (`RefractoryPeriod`, `LogDampening`) accept zero as an intentional disable signal.
 
@@ -108,4 +108,6 @@ go test ./...
 go test -race ./...
 ```
 
-Storage tests run against a real bbolt database in `t.TempDir()` — there are no storage mocks. The HNSW implementation is verified against a flat-scan oracle (recall@k floor enforced in tests).
+Storage tests run against a real SQLite database in `t.TempDir()` — there are no storage mocks. The HNSW implementation is verified against a flat-scan oracle (recall@k floor enforced in tests). A multi-handle visibility test (`TestMultiHandle_ConcurrentReadWrite`) opens two `*Storage` handles against the same DB file simultaneously and asserts cross-handle commit visibility — proving the WAL coordination property that lets multiple library-embedded processes share one corpus.
+
+Building requires a working C toolchain because `github.com/mattn/go-sqlite3` is CGO. `CGO_ENABLED=1` (the default on Linux/macOS) is sufficient.

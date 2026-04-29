@@ -9,15 +9,15 @@ import (
 	"github.com/Cidan/memmy/internal/clock"
 	"github.com/Cidan/memmy/internal/embed/fake"
 	"github.com/Cidan/memmy/internal/service"
-	bboltstore "github.com/Cidan/memmy/internal/storage/bbolt"
+	sqlitestore "github.com/Cidan/memmy/internal/storage/sqlite"
 	"github.com/Cidan/memmy/internal/types"
 )
 
-// fixture builds a real bbolt-backed Service with a Fake clock and Fake
-// embedder. All state lives in t.TempDir().
+// fixture builds a real SQLite-backed Service with a Fake clock and
+// Fake embedder. All state lives in t.TempDir().
 type fixture struct {
 	svc   *service.Service
-	store *bboltstore.Storage
+	store *sqlitestore.Storage
 	cl    *clock.Fake
 	emb   *fake.Embedder
 	cfg   service.Config
@@ -25,7 +25,7 @@ type fixture struct {
 
 func newFixture(t *testing.T, dim int, opts ...func(*service.Config)) *fixture {
 	t.Helper()
-	store, err := bboltstore.Open(bboltstore.Options{
+	store, err := sqlitestore.Open(sqlitestore.Options{
 		Path:              filepath.Join(t.TempDir(), "memmy.db"),
 		Dim:               dim,
 		RandSeed:          42,

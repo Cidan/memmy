@@ -299,8 +299,8 @@ memmy is now embeddable directly via `import "github.com/Cidan/memmy"`. The daem
 - [x] `HNSWConfig` re-export is annotated as bbolt-specific so a future second backend triggers an explicit revisit
 
 ### US-702 — Library tests ✅
-- [x] `memmy_test.go` (package `memmy_test`): 19 tests covering required-field validation (DBPath, Embedder, zero-dim), defaults applied, Write→Recall round-trip, Reinforce/Demote/Mark with refractory advancement, Stats reflects writes, Forget by MessageID, TenantSchema accept-valid + reject-invalid (three error codes via `errors.As(err, *ErrTenantInvalid)`), empty schema config returns nil, partial `ServiceConfig` and `HNSW` overrides via the pointer pattern, Close releases the bbolt file lock, Close is idempotent, and a custom user-supplied `Embedder` flowing through `Open`
-- [x] All tests use real bbolt in `t.TempDir()` plus a `FakeClock`, never mocks for storage
+- [x] `memmy_test.go` (package `memmy_test`): 19 tests covering required-field validation (DBPath, Embedder, zero-dim), defaults applied, Write→Recall round-trip, Reinforce/Demote/Mark with refractory advancement, Stats reflects writes, Forget by MessageID, TenantSchema accept-valid + reject-invalid (three error codes via `errors.As(err, *ErrTenantInvalid)`), empty schema config returns nil, partial `ServiceConfig` and `HNSW` overrides via the pointer pattern, Close releases the storage handle, Close is idempotent, and a custom user-supplied `Embedder` flowing through `Open`
+- [x] All tests use the real reference backend in `t.TempDir()` plus a `FakeClock`, never mocks for storage (the underlying backend was migrated to SQLite in Round 8 — same test surface, same `t.TempDir()` pattern)
 
 ### US-703 — Documentation ✅
 - [x] `README.md`: new "Use as a library" section with full quickstart (Gemini embedder, tenant schema, Open, Write, Recall) and notes on Embedder/TenantSchema/Close/transport semantics
@@ -312,3 +312,58 @@ memmy is now embeddable directly via `import "github.com/Cidan/memmy"`. The daem
 - [x] `go test ./...` all green — **137 tests** across **14 packages** (the new top-level `memmy` package adds 19 tests; module count rises from 13 → 14)
 - [x] `go test -race ./...` all green
 - [x] No changes to `internal/`; the facade is purely additive
+
+## Round 8 — SQLite (WAL) replaces bbolt as the v1 reference backend
+
+bbolt's single-process file-lock semantics blocked the use case of
+multiple host processes (e.g. several `ask` CLI agents) embedding memmy
+against one shared corpus. SQLite in WAL mode coordinates many readers
++ one writer across processes through file locks, with the same
+single-tx-write atomicity the existing code already assumes.
+
+### US-801 — sqlite storage package replaces internal/storage/bbolt ✅
+- [x] `internal/storage/bbolt/` deleted wholesale (no migration — memories blown away)
+- [x] `internal/storage/sqlite/` ships `db.go`, `keys.go`, `codec.go`, `counters.go`, `graph.go`, `scanners.go`, `hnsw.go`, `vectorindex.go` plus the test suite
+- [x] Two `*sql.DB` handles per Storage: writer DSN with `_txlock=immediate` capped at one connection (RESERVED lock upfront prevents SQLITE_BUSY upgrade races); reader DSN with deferred mode for concurrent snapshot reads
+- [x] Pragmas applied at open: `_journal_mode=WAL`, `_synchronous=NORMAL`, `_foreign_keys=ON`, `_busy_timeout` (default 5s, configurable)
+- [x] Schema (DESIGN.md §4.7) bootstrapped idempotently on Open: `tenants`, `nodes`, `messages`, `vectors`, `hnsw_meta`, `hnsw_records`, `edges_out`, `edges_in`, `counters`, `meta` — all `WITHOUT ROWID`
+- [x] gob blob format for structured records and raw little-endian float32 bytes for vectors are unchanged from the bbolt era
+
+### US-802 — Graph + VectorIndex parity ✅
+- [x] Every Graph method ports to SQL with the same atomicity guarantees: `PutNode`/`UpdateNode`/`DeleteNode` adjust counters in the same write tx; `PutEdge`/`UpdateEdge`/`DeleteEdge` write both `edges_out` (tenant, from, to) and `edges_in` (tenant, to, from) inside one tx
+- [x] HNSW algorithms (`hnswInsertTx`, `hnswDeleteTx`, `hnswDetachTx`, `searchLayerTx`, `greedyDescentTx`, `linkAndPruneTx`, `pickEntryPointTx`, neighbor-selection heuristic, candidate PQs, layer sampling) ported verbatim, swapping the four `*bbolt.Tx`-bucket helpers for SQL row helpers
+- [x] Counters (gob-encoded `tenantCounters` blob per tenant) maintained transactionally; `TenantStats` reads counters + `hnsw_meta` in O(1)
+- [x] Scanners (`RecentNodeIDs`, `NodesForMessage`, `MessageIDsBefore`) translate ULID-prefix reverse cursor scans into `WHERE tenant=? AND id >= ? ORDER BY id DESC LIMIT N`
+- [x] MVCC closure-retry safety: `UpdateNode` / `UpdateEdge` keep the "reset closure-captured state at top of body" discipline (architect note 2026-04-27); under SQLite WAL with BEGIN IMMEDIATE the retry case shouldn't fire, but the discipline costs nothing and protects future Postgres/Spanner ports
+
+### US-803 — Wiring and library facade ✅
+- [x] `internal/config/config.go`: `StorageConfig.Backend` defaults to `"sqlite"`; `SQLite SQLiteStorageConfig` (path + busy_timeout) replaces `BBolt`; validation error message updated
+- [x] `cmd/memmy/main.go` opens via `sqlitestore.Open` and rejects `bbolt` with a clear error
+- [x] `memmy.go` library facade: bbolt import removed; `HNSWConfig` re-exported from `sqlitestore`; `Options.OpenTimeout` renamed `Options.BusyTimeout` (the SQLite busy-timeout pragma window)
+- [x] `memmy_test.go`: `TestClose_ReleasesDBLock` → `TestClose_ReleasesDBHandle`; `OpenTimeout` references renamed
+- [x] `internal/transport/mcp/mcp_test.go` and `internal/service/service_test.go` switched to sqlitestore; identical test surface
+- [x] `internal/service/{write,forget}.go` doc comments updated to reference SQLite
+
+### US-804 — Tests ported and extended ✅
+- [x] Storage suite ported file-for-file: `db_test.go`, `graph_test.go`, `counters_test.go`, `hnsw_test.go`, `vectorindex_test.go`, `codec_export_test.go`, `storage_testhelp_test.go`. Real SQLite in `t.TempDir()`; no mocks
+- [x] HNSW oracle test recall@8 ≥ 0.95 with `oversample=200` over a 2000×32-dim corpus — same floor that bbolt was meeting
+- [x] New: `TestOpen_WALMode` PRAGMA-checks `journal_mode=wal` post-open; `TestOpen_SchemaVersionRecorded` confirms the schema marker; `TestGraph_Edge_UpdateEdge_ClosureErrorAborts` proves edges_in + edges_out both roll back on closure error
+- [x] New: `TestMultiHandle_ConcurrentReadWrite` opens two `*Storage` handles against the same DB file simultaneously, writes through one, and reads through the other — the property bbolt could not satisfy
+
+### US-805 — bbolt fully removed ✅
+- [x] `internal/storage/bbolt/` directory deleted
+- [x] `go.etcd.io/bbolt` dropped from `go.mod` / `go.sum`
+- [x] `github.com/mattn/go-sqlite3` added to approved-deps list (CLAUDE.md)
+- [x] No live code references to bbolt anywhere in the repo
+
+### US-806 — Documentation ✅
+- [x] DESIGN.md §0 #1 / §0 #3 / §1 / §2 / §4.7 / §13.1 / §13.3 / §14 / §15 updated to reference SQLite as the v1 reference backend with the new schema sketch
+- [x] CLAUDE.md Stack section, Approved-deps list, Architectural rules, and Testing section all reference SQLite
+- [x] README.md describes SQLite WAL multi-process semantics and the CGO build requirement
+- [x] `memmy.example.yaml` ships `backend: sqlite` with `sqlite.path` and a documented `busy_timeout` knob
+
+### US-807 — Final regression ✅
+- [x] `go vet ./...` clean
+- [x] `go build ./...` clean
+- [x] `go test ./...` all green
+- [x] `go test -race ./...` all green

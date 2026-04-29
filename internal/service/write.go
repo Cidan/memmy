@@ -141,9 +141,9 @@ func (s *Service) putStructuralEdgePair(ctx context.Context, tenant, a, b string
 // `since`, in DESCENDING chronological order, excluding nodes whose
 // SourceMsgID == excludeMsgID.
 //
-// We rely on the bbolt-internal layout (ULIDs are lex-sortable) by going
-// through a backend-aware helper. For non-bbolt backends, this would
-// translate to an ORDER BY CreatedAt DESC LIMIT N query.
+// Implementation goes through a backend-aware helper because ULID
+// lex-sortability lets some backends (e.g. SQLite via PRIMARY KEY
+// (tenant, id)) translate it to a single ORDER BY ... DESC LIMIT N.
 func (s *Service) recentNodeIDsInTenant(ctx context.Context, tenant string, since time.Time, excludeMsgID string, maxN int) ([]string, error) {
 	scanner, ok := s.graph.(recentNodeScanner)
 	if !ok {
@@ -154,8 +154,8 @@ func (s *Service) recentNodeIDsInTenant(ctx context.Context, tenant string, sinc
 
 // recentNodeScanner is an optional capability that storage backends MAY
 // implement to expose efficient "most recent N nodes since T" queries.
-// The bbolt backend implements it via a reverse cursor scan on the
-// nodes/ bucket (ULIDs are lex-sortable).
+// The SQLite backend implements it via SELECT ... ORDER BY id DESC
+// LIMIT N (ULIDs are lex-sortable).
 type recentNodeScanner interface {
 	RecentNodeIDs(ctx context.Context, tenant string, since time.Time, excludeMsgID string, maxN int) ([]string, error)
 }

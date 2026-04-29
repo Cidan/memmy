@@ -1,7 +1,7 @@
 // Package types holds the domain entities used throughout memmy.
 //
 // Storage backends serialize these values into their native primitives
-// (bbolt buckets, SQL tables, Bigtable column families). The shapes
+// (SQLite tables, Postgres rows, Bigtable column families). The shapes
 // defined here are part of the design contract — see DESIGN.md §4.
 package types
 

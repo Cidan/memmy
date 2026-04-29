@@ -1,4 +1,4 @@
-package bboltstore_test
+package sqlitestore_test
 
 import (
 	"context"
@@ -39,7 +39,6 @@ func TestVectorIndex_Flat_TopK(t *testing.T) {
 		t.Fatalf("got %d hits, want 10", len(got))
 	}
 
-	// Brute-force oracle: sort all known vectors by sim with q (both normalized).
 	type pair struct {
 		id  string
 		sim float64
@@ -159,7 +158,6 @@ func TestVectorIndex_Delete(t *testing.T) {
 func randVec(r *rand.Rand, dim int) []float32 {
 	v := make([]float32, dim)
 	for i := range v {
-		// Centered around 0, range roughly [-1, 1].
 		v[i] = float32(r.Float64()*2 - 1)
 	}
 	return v
@@ -188,4 +186,3 @@ func dotF(a, b []float32) float64 {
 	}
 	return s
 }
-

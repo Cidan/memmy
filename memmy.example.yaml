@@ -16,9 +16,15 @@ server:
       enabled: false
 
 storage:
-  backend: bbolt
-  bbolt:
+  # SQLite (WAL mode) is the v1 reference backend. WAL coordination
+  # lets multiple host processes share one DB file: many readers + one
+  # writer at a time. SQLite stores `-wal` and `-shm` sidecar files
+  # alongside `path` while the database is open.
+  backend: sqlite
+  sqlite:
     path: "./data/memmy.db"
+    # busy_timeout: 5s   # how long blocked writers wait for the
+                          # reserved lock; 0 → 5s default.
 
 embedder:
   # Set backend to "gemini" for production.

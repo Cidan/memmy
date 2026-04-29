@@ -36,7 +36,7 @@ import (
 	"github.com/Cidan/memmy/internal/embed/fake"
 	"github.com/Cidan/memmy/internal/embed/gemini"
 	"github.com/Cidan/memmy/internal/service"
-	bboltstore "github.com/Cidan/memmy/internal/storage/bbolt"
+	sqlitestore "github.com/Cidan/memmy/internal/storage/sqlite"
 	"github.com/Cidan/memmy/internal/types"
 )
 
@@ -176,22 +176,17 @@ func NewTenantSchema(cfg TenantSchemaConfig) (*TenantSchema, error) {
 	return service.NewTenantSchemaFromConfig(cfg)
 }
 
-// HNSWConfig holds the index hyperparameters for the bbolt VectorIndex
+// HNSWConfig holds the index hyperparameters for the SQLite VectorIndex
 // backend. See DESIGN.md §12.
-//
-// NOTE: this type is currently re-exported directly from
-// internal/storage/bbolt and is therefore bbolt-specific. When a second
-// storage backend ships, this re-export will need to be abstracted (or
-// the field on Options renamed to make the coupling explicit).
-type HNSWConfig = bboltstore.HNSWConfig
+type HNSWConfig = sqlitestore.HNSWConfig
 
 // DefaultHNSWConfig returns the documented HNSW defaults.
-func DefaultHNSWConfig() HNSWConfig { return bboltstore.DefaultHNSWConfig() }
+func DefaultHNSWConfig() HNSWConfig { return sqlitestore.DefaultHNSWConfig() }
 
 // Options configures Open. DBPath and Embedder are required; everything
 // else has a sensible zero-value default.
 type Options struct {
-	// DBPath is the bbolt database file path. The directory is created
+	// DBPath is the SQLite database file path. The directory is created
 	// if absent. A leading "~/" is expanded to the current user's
 	// home directory. Required.
 	DBPath string
@@ -229,19 +224,19 @@ type Options struct {
 	// linear scan instead of HNSW. Optional; 0 → 5000 (DESIGN.md §6.1).
 	FlatScanThreshold int
 
-	// OpenTimeout caps how long bbolt waits for the file lock during
-	// Open. 0 blocks indefinitely.
-	OpenTimeout time.Duration
+	// BusyTimeout caps how long a blocked SQLite writer waits for the
+	// reserved lock before failing with SQLITE_BUSY. 0 → 5 seconds.
+	BusyTimeout time.Duration
 
 	// HNSWRandSeed seeds the HNSW layer-assignment RNG. 0 → time-derived
 	// (production). Tests should pass a fixed seed for determinism.
 	HNSWRandSeed uint64
 }
 
-// Open constructs a Service backed by bbolt at opts.DBPath. The returned
-// io.Closer must be invoked at shutdown to release the database file
-// lock. The Embedder's lifecycle is the caller's responsibility — Open
-// does NOT close it.
+// Open constructs a Service backed by SQLite (WAL mode) at opts.DBPath.
+// The returned io.Closer must be invoked at shutdown to flush WAL state
+// and close the database handles. The Embedder's lifecycle is the
+// caller's responsibility — Open does NOT close it.
 //
 // Open does not start any transport (MCP / gRPC / HTTP); callers drive
 // the returned Service directly. To run a transport, use the cmd/memmy
@@ -267,14 +262,14 @@ func Open(opts Options) (Service, io.Closer, error) {
 		svcCfg = *opts.ServiceConfig
 	}
 
-	storage, err := bboltstore.Open(bboltstore.Options{
+	storage, err := sqlitestore.Open(sqlitestore.Options{
 		Path:              opts.DBPath,
 		Dim:               dim,
 		HNSW:              hnsw,
 		FlatScanThreshold: opts.FlatScanThreshold,
 		Clock:             opts.Clock,
 		RandSeed:          opts.HNSWRandSeed,
-		Timeout:           opts.OpenTimeout,
+		BusyTimeout:       opts.BusyTimeout,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("memmy: open storage: %w", err)

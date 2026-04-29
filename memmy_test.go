@@ -298,13 +298,13 @@ func TestTenantSchema_NilConfigReturnsNilSchema(t *testing.T) {
 	}
 }
 
-func TestClose_ReleasesDBLock(t *testing.T) {
+func TestClose_ReleasesDBHandle(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "memmy.db")
 	openOnce := func() error {
 		_, closer, err := memmy.Open(memmy.Options{
 			DBPath:       dbPath,
 			Embedder:     memmy.NewFakeEmbedder(testDim),
-			OpenTimeout:  500 * time.Millisecond,
+			BusyTimeout:  500 * time.Millisecond,
 			HNSWRandSeed: 7,
 		})
 		if err != nil {
@@ -394,10 +394,10 @@ func TestOpen_PartialHNSWConfigOverride(t *testing.T) {
 	}
 }
 
-// bbolt's Close() is idempotent (returns nil on the second call); the
-// facade's io.Closer surface inherits that, and library callers that
-// rely on the standard `defer closer.Close()` pattern shouldn't get
-// surprised by paired manual closes.
+// The facade's io.Closer surface is idempotent — closing twice returns
+// nil on the second call so library callers that rely on the standard
+// `defer closer.Close()` pattern don't get surprised by paired manual
+// closes.
 func TestClose_IsIdempotent(t *testing.T) {
 	_, closer, err := memmy.Open(memmy.Options{
 		DBPath:       filepath.Join(t.TempDir(), "memmy.db"),

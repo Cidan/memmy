@@ -1,16 +1,16 @@
 # memmy — Project Conventions for Claude
 
-memmy is an LLM memory system written in pure Go (toolchain: **Go 1.26.2**), exposed over MCP and (future) gRPC + HTTP.
+memmy is an LLM memory system written in Go (toolchain: **Go 1.26.2**) with one CGO dependency for SQLite. Exposed over MCP and (future) gRPC + HTTP.
 **`DESIGN.md` is the source of truth for architecture and design rationale.** Read it first; the design principles in §0 are load-bearing.
 **`IMPLEMENTATION.md` is the running checklist** for what's built and what's left. Update it as work lands.
 This file captures conventions and preferences for working in this repo.
 
 ## Stack
 
-- **Go 1.26.2.** Pure-Go where reasonable — avoid CGO.
+- **Go 1.26.2.** Pure-Go where reasonable; CGO is permitted for the SQLite driver only.
 - **MCP server library**: `github.com/modelcontextprotocol/go-sdk` (the official Go SDK). v1 transport.
 - **`suture`** — process supervision.
-- **Storage backend — pluggable.** v1 reference: `bbolt`. Future targets: Postgres, MariaDB, Bigtable, Spanner, badger, pebble. All hide behind the `Graph` and `VectorIndex` interfaces (DESIGN.md §9.2).
+- **Storage backend — pluggable.** v1 reference: SQLite (WAL mode) via `github.com/mattn/go-sqlite3` — multi-process via `_journal_mode=WAL`, `_busy_timeout`, `_txlock=immediate` for writers. Future targets: Postgres, MariaDB, Bigtable, Spanner, badger, pebble. All hide behind the `Graph` and `VectorIndex` interfaces (DESIGN.md §9.2).
 - **`go-genai`** — Gemini embeddings provider (first impl).
 
 No bleve. No external search engine. **The configured storage backend is the single source of truth.**
@@ -19,7 +19,7 @@ No bleve. No external search engine. **The configured storage backend is the sin
 
 These are restatements of the load-bearing principles in DESIGN.md §0. Do not deviate without updating DESIGN.md first and discussing with the user.
 
-- **One source of truth: the database.** Vectors, HNSW links, and everything else live in the configured storage backend. No secondary store, no in-memory index file. The reference backend is bbolt; the same logical model maps to Postgres, Bigtable, Spanner, etc.
+- **One source of truth: the database.** Vectors, HNSW links, and everything else live in the configured storage backend. No secondary store, no in-memory index file. The reference backend is SQLite (WAL mode); the same logical model maps to Postgres, Bigtable, Spanner, etc.
 - **Storage is pluggable; retrieval policy is not.** Backends are interchangeable behind `Graph` + `VectorIndex`. Retrieval scoring, oversampling, reinforcement, decay, and HNSW correctness live in the Memory Service and do not change per backend.
 - **Stateless service.** memmy holds NO in-memory data state across requests. Permitted: connection pools (DB, embedder, client transport sessions), config (read-only), process-local semaphores. Forbidden: caches of database content, in-memory tenant registries, in-memory `HNSWMeta` copies, accumulators, indexes. Per-request transient state (heaps, queues, visited sets) is created and freed in-request. This is what enables N-node horizontal scale-out against a multi-writer backend.
 - **Transport adapters wrap a single `MemoryService`.** All transports — MCP, gRPC, HTTP, future — call into the same `MemoryService` interface (DESIGN.md §9.1). Adapters live in `internal/transport/<name>/`. Adapters NEVER touch `Embedder`, `VectorIndex`, or `Graph` directly.
@@ -51,7 +51,7 @@ These are restatements of the load-bearing principles in DESIGN.md §0. Do not d
 
 ## Testing
 
-- **Real storage backend in tests**, in `t.TempDir()` for embedded backends, test containers / shared dev instances for networked backends. **No mocks for storage.** v1 runs against bbolt; new backends must pass the same suite.
+- **Real storage backend in tests**, in `t.TempDir()` for embedded backends, test containers / shared dev instances for networked backends. **No mocks for storage.** v1 runs against SQLite; new backends must pass the same suite.
 - **Storage compatibility suite**: a portable test suite that runs against any `Graph + VectorIndex` implementation — verifies CRUD, prefix-scan ordering, transaction atomicity (including aborts leaving consistent state), bidirectional neighbor lookup, and tombstone semantics.
 - **HNSW oracle test**: HNSW search results must agree with flat-scan results above a recall floor (e.g., recall@k ≥ 0.95 with `oversampleN=300` for `k=8`). Property-based across corpus sizes.
 - **Service-level tests** target `MemoryService` directly without any transport adapter — proves the service is transport-agnostic.
@@ -66,7 +66,7 @@ These are restatements of the load-bearing principles in DESIGN.md §0. Do not d
 ## Workflow
 
 - Consult official docs first when integrating an SDK/library (delegate to `document-specialist` agent or use Context Hub).
-- **Ask the user before adding a new third-party dependency.** Approved deps so far: `github.com/modelcontextprotocol/go-sdk`, `suture`, `bbolt`, `go-genai`.
+- **Ask the user before adding a new third-party dependency.** Approved deps so far: `github.com/modelcontextprotocol/go-sdk`, `suture`, `github.com/mattn/go-sqlite3`, `go-genai`.
 - Update `DESIGN.md` *before* the code when changing design.
 - Don't refactor opportunistically during a feature change; keep diffs reviewable.
 

@@ -15,15 +15,15 @@ import (
 	"github.com/Cidan/memmy/internal/config"
 	"github.com/Cidan/memmy/internal/embed/fake"
 	"github.com/Cidan/memmy/internal/service"
-	bboltstore "github.com/Cidan/memmy/internal/storage/bbolt"
+	sqlitestore "github.com/Cidan/memmy/internal/storage/sqlite"
 	mcpadapter "github.com/Cidan/memmy/internal/transport/mcp"
 )
 
-// connect builds a real bbolt-backed MemoryService, wraps it in an MCP
-// adapter, and returns an in-process MCP client session.
+// connect builds a real SQLite-backed MemoryService, wraps it in an
+// MCP adapter, and returns an in-process MCP client session.
 func connect(t *testing.T) *mcpsdk.ClientSession {
 	t.Helper()
-	store, err := bboltstore.Open(bboltstore.Options{
+	store, err := sqlitestore.Open(sqlitestore.Options{
 		Path: filepath.Join(t.TempDir(), "memmy.db"),
 		Dim:  32, RandSeed: 42,
 		FlatScanThreshold: 100000,
@@ -84,7 +84,7 @@ func TestMCP_ToolList(t *testing.T) {
 // to escape the refractory window or advance Mark windows.
 func connectWithFixture(t *testing.T) (*mcpsdk.ClientSession, *clock.Fake) {
 	t.Helper()
-	store, err := bboltstore.Open(bboltstore.Options{
+	store, err := sqlitestore.Open(sqlitestore.Options{
 		Path: filepath.Join(t.TempDir(), "memmy.db"),
 		Dim:  32, RandSeed: 42,
 		FlatScanThreshold: 100000,
@@ -402,7 +402,7 @@ func TestMCP_Stats(t *testing.T) {
 // schema rendering and corrective error round-tripping.
 func connectWithSchema(t *testing.T, schema *service.TenantSchema) *mcpsdk.ClientSession {
 	t.Helper()
-	store, err := bboltstore.Open(bboltstore.Options{
+	store, err := sqlitestore.Open(sqlitestore.Options{
 		Path: filepath.Join(t.TempDir(), "memmy.db"),
 		Dim:  32, RandSeed: 42,
 		FlatScanThreshold: 100000,
@@ -617,7 +617,7 @@ func TestMCP_TenantSchema_DescriptionRendersIntoToolListing(t *testing.T) {
 }
 
 func TestMCP_RunTransport_StdioCodePath(t *testing.T) {
-	store, err := bboltstore.Open(bboltstore.Options{
+	store, err := sqlitestore.Open(sqlitestore.Options{
 		Path: filepath.Join(t.TempDir(), "memmy.db"),
 		Dim:  32, RandSeed: 42,
 		FlatScanThreshold: 100000,

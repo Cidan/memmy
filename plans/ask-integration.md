@@ -67,7 +67,7 @@ the same way `ask_user_question` and `approval_prompt` already are.
 In `ask`:
 
 - **`memory.go`** — owns a single `*memmy.Service`, constructed once
-  at startup against bbolt at `~/.local/share/ask/memmy.db`. Each
+  at startup against SQLite at `~/.local/share/ask/memmy.db`. Each
   tab's `mcpBridge` gets a reference to it.
 - **Tools registered on the existing per-tab `mcpBridge`**:
   `memory.recall`, `memory.write`, `memory.reinforce`,
@@ -104,7 +104,7 @@ In memmy:
 
 1. **Embedded library vs subprocess.** Default: embedded. memmy's
    `cmd/memmy` and stdio/HTTP adapters stay alive for non-`ask`
-   users. `ask` just links memmy as a module. The bbolt file lives
+   users. `ask` just links memmy as a module. The SQLite file lives
    under `ask`'s data dir; if a user also runs standalone memmy they
    point it at a different DB.
 2. **Auto-write granularity.** Per-turn (cheap, coarse) vs
