@@ -1,2 +1,10 @@
 /.omc/**
 .claude/worktrees/
+
+# memmy-eval framework local artifacts (datasets live outside the repo
+# at $MEMMY_EVAL_HOME / ~/.local/share/memmy-eval; these are escape
+# hatches for if a user ever stages outputs inside the repo by mistake).
+/eval/fixtures/
+/eval/notebooks/outputs/
+/memmy-eval
+/memmy

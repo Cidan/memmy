@@ -1,0 +1,46 @@
+# Sample memmy-eval `run --config` file.
+#
+# Every key under `service:` overrides the corresponding field on
+# memmy.DefaultServiceConfig() (see DESIGN.md §12). Only list the
+# fields you want to override; the rest stay at their documented
+# defaults.
+#
+# Times use Go's duration syntax for fields whose JSON name is a
+# string ("60s", "5m"); pure-number fields (NodeDelta, etc.) take
+# bare YAML numbers.
+
+service:
+  # Retrieval defaults
+  DefaultK: 8
+  DefaultHops: 2
+  DefaultOversample: 300
+  SimAlpha: 1.0
+  WeightBeta: 0.5
+
+  # Decay (per-second). Lower = memories fade slower.
+  NodeLambda: 8.0e-8
+  EdgeStructuralLambda: 4.0e-8
+  EdgeCoRetrievalLambda: 2.7e-7
+  EdgeCoTraversalLambda: 1.3e-7
+
+  # Reinforcement
+  NodeDelta: 1.0
+  EdgeCoRetrievalBase: 0.5
+  EdgeCoTraversalMultiplier: 1.5
+
+  # Pruning
+  EdgeFloor: 0.05
+  NodeFloor: 0.01
+  WeightCap: 100.0
+
+  # Refractory + log-dampening (for explicit Reinforce/Demote/Mark only).
+  RefractoryPeriod: 60000000000   # 60s in nanoseconds
+  LogDampening: true
+  MarkMaxNodes: 256
+
+hnsw:
+  M: 16
+  M0: 32
+  EfConstruction: 200
+  EfSearch: 100
+  ML: 0.36

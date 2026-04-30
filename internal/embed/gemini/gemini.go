@@ -70,14 +70,36 @@ func New(ctx context.Context, opts Options) (*Embedder, error) {
 
 func (e *Embedder) Dim() int { return e.dim }
 
+// maxBatchSize is the documented BatchEmbedContents limit on the
+// Gemini API. Inputs larger than this are split into successive calls
+// and the results concatenated.
+const maxBatchSize = 100
+
 // Embed satisfies embed.Embedder. The task hint is mapped to the
 // strategy chosen at construction time: a TaskType API parameter for
 // "param" models, or a prompt prefix on each input for "prefix"
 // models. The fake embedder ignores task entirely; here we honor it.
+//
+// Inputs larger than the API's per-batch cap are split transparently.
 func (e *Embedder) Embed(ctx context.Context, task embed.EmbedTask, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
+	out := make([][]float32, 0, len(texts))
+	for start := 0; start < len(texts); start += maxBatchSize {
+		end := min(start+maxBatchSize, len(texts))
+		vecs, err := e.embedBatch(ctx, task, texts[start:end])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, vecs...)
+	}
+	return out, nil
+}
+
+// embedBatch sends one EmbedContent call. Caller must ensure
+// len(texts) <= maxBatchSize.
+func (e *Embedder) embedBatch(ctx context.Context, task embed.EmbedTask, texts []string) ([][]float32, error) {
 	contents := make([]*genai.Content, len(texts))
 	// OutputDimensionality is documented as supported on
 	// gemini-embedding-001 and gemini-embedding-2 (Matryoshka:

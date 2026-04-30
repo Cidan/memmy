@@ -367,3 +367,269 @@ single-tx-write atomicity the existing code already assumes.
 - [x] `go build ./...` clean
 - [x] `go test ./...` all green
 - [x] `go test -race ./...` all green
+
+## Round 9 — Validation framework (`memmy-eval`)
+
+Local-only CLI for measuring memmy's retrieval quality and decay /
+reinforcement dynamics against a controllable corpus extracted from
+Claude Code session JSONL. Datasets live OUTSIDE the repo at
+`$MEMMY_EVAL_HOME` (default `~/.local/share/memmy-eval/<name>/`); only
+the framework code ships in the repo.
+
+Approved deps added: `github.com/spf13/cobra`,
+`github.com/schollz/progressbar/v3`. Updated CLAUDE.md approved-deps
+list.
+
+### US-EVAL-001 — Approved deps + CLAUDE.md ✅
+- [x] `go.mod` declares `cobra` v1.10.2 and `schollz/progressbar/v3` v3.19.0
+- [x] CLAUDE.md approved-deps list updated
+
+### US-EVAL-002 — `internal/eval/dataset` ✅
+- [x] `Open(root, name)` resolves `$MEMMY_EVAL_HOME` (or
+      `~/.local/share/memmy-eval`), creates `<name>/runs/`, idempotent
+- [x] Typed paths for `corpus.sqlite`, `queries.sqlite`, `manifest.json`,
+      `runs/<id>/`
+- [x] `ListDatasets(root)` walks the root, returns per-dataset stats
+      from manifest + best-effort directory walks; missing root is silent
+- [x] Tests cover idempotent re-Open, run-dir creation, env-override
+      resolution, name-validation rejection, and listing
+
+### US-EVAL-003 — `internal/eval/corpus` ✅
+- [x] `Extract(path, fn)` streams turns from a single .jsonl OR a
+      directory of them; honors `Turn` callback errors
+- [x] Decodes user/assistant turns; skips file-history-snapshot, system,
+      queue-operation, sidechain
+- [x] Polymorphic `message.content` decode: string OR array of
+      typed blocks (text only; thinking, tool_use, tool_result skipped)
+- [x] `OpenStore` materializes corpus.sqlite with `source_files` (dedup)
+      + `turns` tables; chronological iteration; stable `SnapshotHash`
+- [x] Tests cover filter, polymorphic decode, dir lex-ordering, callback
+      error propagation, store dedup, hash stability, file-hash helper
+
+### US-EVAL-004 — `internal/eval/embedcache` ✅
+- [x] Content-addressed sqlite cache keyed by
+      `(model_id, dim, sha256(text))`, raw little-endian f32 vectors
+- [x] `EmbedBatch(ctx, embedder, modelID, task, texts)` returns input-
+      ordered vectors; cache hits skip embedder calls; misses are
+      embedded then cached
+- [x] Tests cover round-trip, miss reporting, dedup of repeated calls,
+      mixed hit/miss order preservation, and count
+
+### US-EVAL-005 — `internal/eval/queries` ✅
+- [x] `Generator` + `Judge` interfaces; `FakeGenerator` (paraphrase +
+      distractor + tagged stubs for other categories) and `FakeJudge`
+      (token-overlap scoring) ship in the same package
+- [x] `OpenStore` materializes queries.sqlite with `queries` table
+      (per-query embedding blob) + `judgments` cache table
+- [x] `Put` is idempotent; `CountForGeneration(version, snapshot,
+      category)` powers the dedup key
+- [x] `PutEmbedding` / `Embedding(dim)` round-trip cached query vectors
+- [x] Tests cover generator output shape, fake-judge token overlap,
+      store dedup, generation counting, embedding round-trip
+
+### US-EVAL-006 — `internal/eval/inspect` ✅
+- [x] Read-only sqlite reader (`mode=ro`, `_query_only=1`) opens the
+      same db file the live service writes; no shared connection pool
+- [x] `ListTenants`, `ListNodes(tenant)`, `NodeState(tenant, id)`,
+      `NodeStates(tenant, ids)` decode gob-encoded Node records
+- [x] Test writes via the memmy facade then reads back via inspect;
+      weights, edge counts, last-touched all round-trip
+
+### US-EVAL-007 — `internal/eval/manifest` ✅
+- [x] `DatasetManifest` (sessions source, embedder, chunk count, snapshot
+      hash, timestamps) and `RunManifest` (run id, memmy git SHA,
+      service+HNSW config blobs, queries executed)
+- [x] Atomic JSON write via tmp+rename; SchemaVersion field
+- [x] `MemmyGitSHA()` reads `runtime/debug.ReadBuildInfo` `vcs.revision`,
+      falls back to "unknown" under `go test`
+- [x] Tests cover round-trip for both manifest types and SHA non-empty
+
+### US-EVAL-008 — `internal/eval/harness` ✅
+- [x] `Ingest` walks JSONL via `corpus.Extract`, persists turns via
+      `corpus.Store`, chunks via `internal/chunker.Default`, embeds via
+      `embedcache.EmbedBatch`. Idempotent per source file
+      (path+mtime+sha256). Optional `Progress` callback for cobra bars.
+- [x] `Replay` reads turns chronologically, drives a `memmy.FakeClock`
+      to each turn's timestamp, calls `svc.Write` under tenant
+      `{agent: memmy-eval, dataset: <name>}`. The wrapped embedder
+      consults the embedcache so re-replay never re-embeds. Returns a
+      live `memmy.Service` handle for the query battery.
+- [x] `RunQueries` snapshots per-tenant node state pre-Recall (via
+      inspect), executes Recall, captures hits + score breakdowns +
+      post-state for the top-K. Optional `AdvanceClock` between queries
+      defeats the default 60s explicit-bump refractory window.
+- [x] `harness_test.go` runs the full ingest → replay → queries → metrics
+      pipeline against synthetic JSONL in `t.TempDir()` using fake
+      embedder + fake judge. Verifies dedup, clock advancement to last
+      turn timestamp, summary.json existence, recall in [0, 1].
+
+### US-EVAL-009 — `internal/eval/metrics` ✅
+- [x] `Compute(QueryResult, turnUUIDForNode)` produces a flat `QueryRow`:
+      hit IDs, gold flags, recall@1/3/5/8, MRR, nDCG, plus
+      `ReinforcementSum`/`Max` from pre/post `inspect.NodeState` deltas
+- [x] `Aggregate(runID, dataset, rows)` rolls up overall + per-category
+      averages
+- [x] `WriteRun(outDir, rows, summary)` emits `queries.jsonl` (one row
+      per query) and `summary.json` (aggregate)
+- [x] Tests cover recall@k boundary cases, MRR / NDCG known-input
+      values, no-gold zero credit, reinforcement-from-pre/post, and
+      aggregate averaging
+
+### US-EVAL-010 — `internal/eval/sweep` ✅
+- [x] `Load(path)` parses sweep YAML: `base` config (optional) + `matrix`
+      of `{name, overrides, hnsw}` entries
+- [x] `ApplyServiceOverrides` and `ApplyHNSWOverrides` JSON-marshal the
+      base config, splice the override map in by key, unmarshal back
+      into the typed config — no per-field knowledge needed in YAML
+- [x] Tests cover load shape, single-field override survives untouched
+      siblings, missing-matrix rejection
+
+### US-EVAL-011 — `cmd/memmy-eval` cobra binary ✅
+- [x] Subcommands: `ingest`, `queries`, `run`, `sweep`, `ls`
+- [x] `ingest --sessions PATH --dataset NAME --embedder fake|gemini`;
+      progress bar via `schollz/progressbar/v3` for files + chunks;
+      idempotent re-runs print `skipped(dup)=N`; updates dataset
+      manifest with chunk count + snapshot hash
+- [x] `queries --dataset NAME --n N --categories paraphrase,distractor,...`
+      generates with the fake generator; updates dataset manifest
+      QueryCount on success
+- [x] `run --dataset NAME --config PATH --embedder ... --k K --hops H`
+      replays into a fresh per-run memmy db under `runs/<run_id>/`,
+      executes the query battery, writes `queries.jsonl` +
+      `summary.json` + `manifest.json`
+- [x] `sweep --dataset NAME --matrix PATH` runs each matrix entry as
+      a fresh `executeRun`, one db per entry; sequential v1 (parallel
+      hook reserved for a follow-up)
+- [x] `ls` prints datasets + chunk + query + run counts via tabwriter
+- [x] `--help` renders cleanly on root and every subcommand
+- [x] Smoke run on `~/.claude/projects/-home-antonio-git-nanomite`
+      (3 files, 274 turns, 1798 chunks, 10 queries, 3-entry sweep) all
+      pass
+
+### US-EVAL-012 — End-to-end test ✅
+- [x] `internal/eval/harness/harness_test.go` (synthetic JSONL → ingest
+      → queries → run → metrics) under `t.TempDir()`. Uses fake
+      embedder + fake judge — no API key required
+- [x] Test runs in <2s on a developer laptop
+
+### US-EVAL-013 — Sample configs + README ✅
+- [x] `eval/README.md` orients new readers (pipeline diagram, fake
+      quickstart, Gemini quickstart, sweep example, dataset root,
+      result interpretation, deltas-not-absolutes note)
+- [x] `eval/configs/baseline.yaml` consumable by `run --config`
+- [x] `eval/configs/sweep.yaml` consumable by `sweep --matrix` (3 entries)
+- [x] `.gitignore` excludes `eval/fixtures/`, `eval/notebooks/outputs/`,
+      `/memmy-eval`, `/memmy`
+
+### US-EVAL-014 — Smoke run on real session dir ✅
+- [x] `MEMMY_EVAL_HOME=/tmp/memmy-eval-smoke memmy-eval ingest
+      --sessions /home/antonio/.claude/projects/-home-antonio-git-nanomite
+      --dataset nanomite-smoke --embedder fake --fake-dim 32 --limit 3`
+      — files=3 turns=274 chunks=1798
+- [x] Re-ingest = 0 turns added, `skipped(dup)=3`
+- [x] `memmy-eval queries --dataset nanomite-smoke --n 5` produced 10
+      queries; `memmy-eval ls` reflects the manifest counts
+- [x] `memmy-eval run --dataset nanomite-smoke --embedder fake
+      --fake-dim 32 --k 5 --hops 1` produced
+      `runs/run-XXX/{summary.json,queries.jsonl,manifest.json,memmy.db}`
+      with non-zero `overall_reinforcement_mean`
+- [x] `memmy-eval sweep --dataset nanomite-smoke --matrix
+      eval/configs/sweep.yaml` produced 3 per-entry summary files;
+      `high-reinforce` shows reinforce_mean ≈ 12.5 vs baseline ≈ 5.0
+      (the framework's whole point — measuring config-induced dynamics
+      deltas)
+
+### US-EVAL-015 — Final regression ✅
+- [x] `go vet ./...` clean
+- [x] `go build ./...` clean (binary at `cmd/memmy-eval`)
+- [x] `go test ./...` all green
+- [x] DESIGN.md untouched (the framework is tooling, not core architecture)
+
+## Round 9b — Validation framework: test-coverage gap fill
+
+Verifier of Round 9 flagged two PARTIAL-coverage areas (sweep e2e and
+non-zero-reinforcement assertion). User asked to "heavily test this
+code" with two explicit exclusions: Gemini embedder (no API key in
+tests) and the cobra binary (per user direction). This round adds 8
+new test files covering 36 new tests; one production-code defect fix
+fell out of the manifest concurrent-writer test.
+
+### US-EVAL-T01 — Sweep multi-entry e2e ✅
+- [x] `internal/eval/sweep/sweep_e2e_test.go::TestSweep_TwoEntriesEndToEnd`
+      drives a 2-entry matrix through harness.Replay + RunQueries +
+      metrics.WriteRun for each entry; asserts both summary.json files
+      exist AND that NodeDelta=5 produces strictly larger reinforce_mean
+      than NodeDelta=0.1 (proves the override actually flowed through).
+
+### US-EVAL-T02 — Corpus extractor edge cases ✅
+- [x] `internal/eval/corpus/edge_cases_test.go` (8 tests): malformed
+      JSON propagates file+line, embedded `\n`+`\t` round-trip through
+      extract+store, thinking/tool_use-only assistant message skipped,
+      empty-content user message skipped, missing timestamp parses to
+      zero time, HashFile on 0-byte file matches sha256 of empty input,
+      HashFile missing-file wraps `os.ErrNotExist`,
+      ListJSONLFiles missing-path errors.
+
+### US-EVAL-T03 — Embedcache concurrency + defensive validation ✅
+- [x] `internal/eval/embedcache/edge_cases_test.go` (5 tests): 8
+      goroutines × 5 texts with overlap → quiescent re-call asserts
+      zero new embedder calls; Put with mismatched dim returns error
+      mentioning both numbers; corrupted vector row (manually written)
+      returns error rather than silently truncating; Open empty path
+      errors; Close+re-Open survives with rows readable.
+
+### US-EVAL-T04 — Queries top-up dedup ✅
+- [x] `internal/eval/queries/topup_test.go` (3 tests): N1=3 then N2=5
+      with 2 collisions yields total=5 and original GeneratedAt +
+      GoldTurnUUIDs preserved; different corpus_snapshot still bound to
+      query_id PK; ByCategory filters cleanly.
+
+### US-EVAL-T05 — Manifest atomic write + schema-version skew ✅
+- [x] `internal/eval/manifest/edge_cases_test.go` (6 tests): empty path
+      errors; missing file wraps `os.ErrNotExist`; **16 concurrent
+      racers leave a valid manifest with no .tmp leftovers**; future
+      SchemaVersion=99 + unknown field still decodes; WriteRun empty
+      path errors; ReadRun missing-file errors.
+- [x] **Production-code fix exposed by this round:** `manifest.writeJSON`
+      now uses `os.CreateTemp(dir, base+".*.tmp")` instead of a fixed
+      `path + ".tmp"`. Old code lost rename races under concurrent
+      writers (the test originally failed with "rename: ... no such
+      file or directory" for ~5 of 16 goroutines). New code is
+      atomic-per-call; the 16-racer test passes.
+
+### US-EVAL-T06 — Replay edge cases ✅
+- [x] `internal/eval/harness/replay_edge_test.go` (3 tests): Replay
+      against an empty corpus succeeds with TurnsReplayed=0 and a
+      usable Service handle; second Replay against the cache-primed
+      corpus calls the underlying embedder ZERO times (counting
+      wrapper); custom TenantTuple flows through and Recall under it
+      returns hits.
+
+### US-EVAL-T07 — Inspect read-during-write semantics ✅
+- [x] `internal/eval/inspect/concurrency_test.go` (3 tests): inspect
+      Reader stays open while 4 concurrent Service.Write goroutines
+      land new nodes; subsequent NodeStates returns all of them;
+      NodeStates silently omits unknown IDs (mixed real/unknown list);
+      ListNodes against an unknown tenant returns empty.
+
+### US-EVAL-T08 — Metrics boundary conditions ✅
+- [x] `internal/eval/metrics/boundaries_test.go` (5 tests): zero hits
+      yields all-zero metrics; gold at rank 8 yields Recall@8=1 +
+      MRR=1/8; multiple gold hits (ranks 1,3) yields NDCG ∈ (0,1] and
+      MRR=1; WriteRun with empty rows produces a valid summary.json +
+      0-byte queries.jsonl; Aggregate with empty-string Category bucket
+      survives without panic.
+
+### US-EVAL-T09 — Final regression ✅
+- [x] `go vet ./...` clean
+- [x] `go build ./...` clean
+- [x] `go test ./...` 217 tests pass across 24 packages (vs 182 baseline
+      = +35 new tests post-deslop). The pre-existing storage / service /
+      mcp / types test counts are unchanged — no regressions.
+- [x] Verifier agent: APPROVE
+- [x] ai-slop-cleaner pass: removed a misleading "in case future tests"
+      comment on a test helper, deleted a duplicate clock-progression
+      test (`TestReplay_FakeClockMonotonicProgression` overlapped
+      `TestReplay_AdvancesClockToTurnTimestamps` from the prior round),
+      cleaned up the now-unused `time` import that fell out of that
+      deletion. Post-deslop regression re-run: clean.

@@ -66,7 +66,7 @@ These are restatements of the load-bearing principles in DESIGN.md §0. Do not d
 ## Workflow
 
 - Consult official docs first when integrating an SDK/library (delegate to `document-specialist` agent or use Context Hub).
-- **Ask the user before adding a new third-party dependency.** Approved deps so far: `github.com/modelcontextprotocol/go-sdk`, `suture`, `github.com/mattn/go-sqlite3`, `go-genai`.
+- **Ask the user before adding a new third-party dependency.** Approved deps so far: `github.com/modelcontextprotocol/go-sdk`, `suture`, `github.com/mattn/go-sqlite3`, `go-genai`, `github.com/spf13/cobra` (CLI for `cmd/memmy-eval`), `github.com/schollz/progressbar/v3` (progress bars for `cmd/memmy-eval`).
 - Update `DESIGN.md` *before* the code when changing design.
 - Don't refactor opportunistically during a feature change; keep diffs reviewable.
 

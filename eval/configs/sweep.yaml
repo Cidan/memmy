@@ -1,0 +1,27 @@
+# Sample memmy-eval `sweep --matrix` file.
+#
+# `base` is optional and points at a starting service config (the same
+# YAML shape as eval/configs/baseline.yaml). When omitted, the memmy
+# defaults are used as the base.
+#
+# `matrix` is the list of overrides applied per run. Each entry yields
+# one fresh memmy db and one runs/<sweep_id>/<entry_name>/ directory.
+
+base: eval/configs/baseline.yaml
+
+matrix:
+  - name: low-decay
+    overrides:
+      NodeLambda: 4.0e-8
+      EdgeStructuralLambda: 2.0e-8
+
+  - name: high-reinforce
+    overrides:
+      NodeDelta: 2.5
+      EdgeCoRetrievalBase: 1.0
+
+  - name: tight-hnsw
+    overrides:
+      DefaultOversample: 600
+    hnsw:
+      EfSearch: 200
