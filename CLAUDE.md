@@ -1,16 +1,16 @@
 # memmy — Project Conventions for Claude
 
-memmy is an LLM memory system written in Go (toolchain: **Go 1.26.2**) with one CGO dependency for SQLite. Exposed over MCP and (future) gRPC + HTTP.
+memmy is an LLM memory system written in Go (toolchain: **Go 1.26.2**) backed by Neo4j (Bolt protocol, native vector index). Exposed over MCP and (future) gRPC + HTTP.
 **`DESIGN.md` is the source of truth for architecture and design rationale.** Read it first; the design principles in §0 are load-bearing.
 **`IMPLEMENTATION.md` is the running checklist** for what's built and what's left. Update it as work lands.
 This file captures conventions and preferences for working in this repo.
 
 ## Stack
 
-- **Go 1.26.2.** Pure-Go where reasonable; CGO is permitted for the SQLite driver only.
+- **Go 1.26.2.** Pure-Go end to end. No CGO.
 - **MCP server library**: `github.com/modelcontextprotocol/go-sdk` (the official Go SDK). v1 transport.
 - **`suture`** — process supervision.
-- **Storage backend — pluggable.** v1 reference: SQLite (WAL mode) via `github.com/mattn/go-sqlite3` — multi-process via `_journal_mode=WAL`, `_busy_timeout`, `_txlock=immediate` for writers. Future targets: Postgres, MariaDB, Bigtable, Spanner, badger, pebble. All hide behind the `Graph` and `VectorIndex` interfaces (DESIGN.md §9.2).
+- **Storage backend — pluggable behind `Graph` + `VectorIndex` interfaces.** Sole reference: Neo4j (community or enterprise) via `github.com/neo4j/neo4j-go-driver/v5`. Native vector index handles HNSW. Migration system bundled in the binary via `embed.FS`; migrations are explicit (the binary refuses to start on schema mismatch; the library exposes `memmy.Migrate()`).
 - **`go-genai`** — Gemini embeddings provider (first impl).
 
 No bleve. No external search engine. **The configured storage backend is the single source of truth.**
@@ -51,7 +51,7 @@ These are restatements of the load-bearing principles in DESIGN.md §0. Do not d
 
 ## Testing
 
-- **Real storage backend in tests**, in `t.TempDir()` for embedded backends, test containers / shared dev instances for networked backends. **No mocks for storage.** v1 runs against SQLite; new backends must pass the same suite.
+- **Real storage backend in tests against a live Neo4j**, partitioned per-test by a unique tenant prefix (UUID-derived) with `t.Cleanup` doing `MATCH (n) WHERE n.tenant STARTS WITH $prefix DETACH DELETE n`. **No mocks for storage.** Tests connect to `NEO4J_URI` (default `bolt://localhost:7687`), `NEO4J_USER` (default `neo4j`), `NEO4J_PASSWORD` (no default — tests t.Skip with helpful message if unset). Same suite must pass for any future backend.
 - **Storage compatibility suite**: a portable test suite that runs against any `Graph + VectorIndex` implementation — verifies CRUD, prefix-scan ordering, transaction atomicity (including aborts leaving consistent state), bidirectional neighbor lookup, and tombstone semantics.
 - **HNSW oracle test**: HNSW search results must agree with flat-scan results above a recall floor (e.g., recall@k ≥ 0.95 with `oversampleN=300` for `k=8`). Property-based across corpus sizes.
 - **Service-level tests** target `MemoryService` directly without any transport adapter — proves the service is transport-agnostic.
@@ -66,7 +66,7 @@ These are restatements of the load-bearing principles in DESIGN.md §0. Do not d
 ## Workflow
 
 - Consult official docs first when integrating an SDK/library (delegate to `document-specialist` agent or use Context Hub).
-- **Ask the user before adding a new third-party dependency.** Approved deps so far: `github.com/modelcontextprotocol/go-sdk`, `suture`, `github.com/mattn/go-sqlite3`, `go-genai`, `github.com/spf13/cobra` (CLI for `cmd/memmy-eval`), `github.com/schollz/progressbar/v3` (progress bars for `cmd/memmy-eval`).
+- **Ask the user before adding a new third-party dependency.** Approved deps so far: `github.com/modelcontextprotocol/go-sdk`, `suture`, `github.com/neo4j/neo4j-go-driver/v5` (Neo4j Bolt driver), `go-genai`, `github.com/spf13/cobra` (CLI for `cmd/memmy-eval`), `github.com/schollz/progressbar/v3` (progress bars for `cmd/memmy-eval`).
 - Update `DESIGN.md` *before* the code when changing design.
 - Don't refactor opportunistically during a feature change; keep diffs reviewable.
 
