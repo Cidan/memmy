@@ -1,65 +1,74 @@
-// Package inspect is a read-only window into a memmy SQLite database
+// Package inspect is a read-only window into a memmy Neo4j database
 // used by the eval harness to capture per-node state (weight, last
 // touch, edge degree) before and after a query.
 //
-// It opens the same db file as the live memmy service in `mode=ro`
-// (independent connection pool; never touches the writer's lock) and
-// decodes the gob-encoded record blobs the SQLite backend produces.
-// This separation keeps memmy.MemoryService out of the harness's path
-// and preserves the stateless-service contract (CLAUDE.md §0 #3).
+// It opens its own bolt driver against the same Neo4j the live memmy
+// service writes to. Reads run as managed read transactions and never
+// interfere with the writer's session pool. This separation keeps
+// memmy.MemoryService out of the harness's path and preserves the
+// stateless-service contract (CLAUDE.md §0 #3).
 package inspect
 
 import (
-	"bytes"
 	"context"
-	"database/sql"
-	"encoding/gob"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
-
-	"github.com/Cidan/memmy/internal/types"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
 
-// Reader is the read-only window. Open one against the same .sqlite
-// file the live service writes to.
+// Connection bundles the Neo4j connection settings.
+type Connection struct {
+	URI      string
+	User     string
+	Password string
+	Database string
+}
+
+// Reader is the read-only window. Open one against the same Neo4j
+// instance the live service writes to.
 type Reader struct {
-	db *sql.DB
+	driver   neo4j.DriverWithContext
+	database string
 }
 
-// Open returns a Reader pointing at path.
-func Open(path string) (*Reader, error) {
-	if path == "" {
-		return nil, errors.New("inspect: path required")
+// Open returns a Reader pointing at conn.
+func Open(conn Connection) (*Reader, error) {
+	if conn.URI == "" {
+		return nil, errors.New("inspect: Connection.URI required")
 	}
-	v := url.Values{}
-	v.Set("mode", "ro")
-	v.Set("_journal_mode", "WAL")
-	v.Set("_busy_timeout", "5000")
-	v.Set("_query_only", "1")
-	dsn := "file:" + path + "?" + v.Encode()
-	db, err := sql.Open("sqlite3", dsn)
+	if conn.User == "" {
+		return nil, errors.New("inspect: Connection.User required")
+	}
+	if conn.Password == "" {
+		return nil, errors.New("inspect: Connection.Password required")
+	}
+	db := conn.Database
+	if db == "" {
+		db = "neo4j"
+	}
+	driver, err := neo4j.NewDriverWithContext(conn.URI, neo4j.BasicAuth(conn.User, conn.Password, ""))
 	if err != nil {
-		return nil, fmt.Errorf("inspect: open: %w", err)
+		return nil, fmt.Errorf("inspect: open driver: %w", err)
 	}
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("inspect: ping: %w", err)
+	verifyCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := driver.VerifyConnectivity(verifyCtx); err != nil {
+		_ = driver.Close(context.Background())
+		return nil, fmt.Errorf("inspect: verify: %w", err)
 	}
-	db.SetMaxOpenConns(2)
-	return &Reader{db: db}, nil
+	return &Reader{driver: driver, database: db}, nil
 }
 
-// Close releases the read handle.
+// Close releases the read-side driver pool.
 func (r *Reader) Close() error {
-	if r.db == nil {
+	if r.driver == nil {
 		return nil
 	}
-	err := r.db.Close()
-	r.db = nil
+	err := r.driver.Close(context.Background())
+	r.driver = nil
 	return err
 }
 
@@ -82,45 +91,56 @@ type Tenant struct {
 
 // ListTenants returns every tenant registered in the db.
 func (r *Reader) ListTenants(ctx context.Context) ([]Tenant, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT id, info FROM tenants ORDER BY id ASC`)
+	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		rec, err := tx.Run(ctx, `MATCH (t:TenantInfo) RETURN t.id AS id, t.tuple_json AS tuple ORDER BY t.id ASC`, nil)
+		if err != nil {
+			return nil, err
+		}
+		var out []Tenant
+		for rec.Next(ctx) {
+			r := rec.Record()
+			id, _ := r.Get("id")
+			tupleRaw, _ := r.Get("tuple")
+			tuple := decodeTupleJSON(asString(tupleRaw))
+			out = append(out, Tenant{ID: asString(id), Tuple: tuple})
+		}
+		return out, rec.Err()
+	})
 	if err != nil {
 		return nil, fmt.Errorf("inspect: list tenants: %w", err)
 	}
-	defer rows.Close()
-	var out []Tenant
-	for rows.Next() {
-		var (
-			id  string
-			raw []byte
-		)
-		if err := rows.Scan(&id, &raw); err != nil {
-			return nil, err
-		}
-		var info types.TenantInfo
-		if err := gobDecode(raw, &info); err != nil {
-			return nil, fmt.Errorf("inspect: decode tenant: %w", err)
-		}
-		out = append(out, Tenant{ID: id, Tuple: info.Tuple})
+	if res == nil {
+		return nil, nil
 	}
-	return out, rows.Err()
+	return res.([]Tenant), nil
 }
 
 // ListNodes returns every node ID for tenant in storage order.
 func (r *Reader) ListNodes(ctx context.Context, tenant string) ([]string, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT id FROM nodes WHERE tenant=? ORDER BY id ASC`, tenant)
+	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		rec, err := tx.Run(ctx, `
+			MATCH (n:Node {tenant: $tenant})
+			RETURN n.id AS id
+			ORDER BY n.id ASC
+		`, map[string]any{"tenant": tenant})
+		if err != nil {
+			return nil, err
+		}
+		var out []string
+		for rec.Next(ctx) {
+			r := rec.Record()
+			id, _ := r.Get("id")
+			out = append(out, asString(id))
+		}
+		return out, rec.Err()
+	})
 	if err != nil {
 		return nil, fmt.Errorf("inspect: list nodes: %w", err)
 	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
+	if res == nil {
+		return nil, nil
 	}
-	return out, rows.Err()
+	return res.([]string), nil
 }
 
 // NodeStates fetches state for the given node IDs in one read tx.
@@ -141,34 +161,104 @@ func (r *Reader) NodeStates(ctx context.Context, tenant string, ids []string) ([
 
 // NodeState reads a single node's state. (state, false, nil) when absent.
 func (r *Reader) NodeState(ctx context.Context, tenant, id string) (NodeState, bool, error) {
-	var raw []byte
-	err := r.db.QueryRowContext(ctx, `SELECT blob FROM nodes WHERE tenant=? AND id=?`, tenant, id).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return NodeState{}, false, nil
-	}
+	res, err := r.read(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		rec, err := tx.Run(ctx, `
+			MATCH (n:Node {tenant: $tenant, id: $id})
+			OPTIONAL MATCH (n)-[r_out:STRUCTURAL|CORETRIEVAL|COTRAVERSAL]->()
+			WITH n, count(r_out) AS oc
+			OPTIONAL MATCH (n)<-[r_in:STRUCTURAL|CORETRIEVAL|COTRAVERSAL]-()
+			RETURN n.id AS id, n.tenant AS tenant, n.weight AS w,
+			       n.last_touched_unix_ms AS lt, n.access_count AS ac,
+			       oc, count(r_in) AS ic
+		`, map[string]any{"tenant": tenant, "id": id})
+		if err != nil {
+			return nil, err
+		}
+		r, err := rec.Single(ctx)
+		if err != nil {
+			return nil, nil
+		}
+		st := NodeState{}
+		raw, _ := r.Get("id")
+		st.NodeID = asString(raw)
+		raw, _ = r.Get("tenant")
+		st.TenantID = asString(raw)
+		raw, _ = r.Get("w")
+		st.Weight = asFloat(raw)
+		raw, _ = r.Get("lt")
+		ms := asInt64(raw)
+		if ms != 0 {
+			st.LastTouched = time.UnixMilli(ms).UTC()
+		}
+		raw, _ = r.Get("ac")
+		st.AccessCount = uint64(asInt64(raw))
+		raw, _ = r.Get("oc")
+		st.EdgeCountOut = int(asInt64(raw))
+		raw, _ = r.Get("ic")
+		st.EdgeCountIn = int(asInt64(raw))
+		return &st, nil
+	})
 	if err != nil {
 		return NodeState{}, false, fmt.Errorf("inspect: get node: %w", err)
 	}
-	var n types.Node
-	if err := gobDecode(raw, &n); err != nil {
-		return NodeState{}, false, fmt.Errorf("inspect: decode node: %w", err)
+	if res == nil {
+		return NodeState{}, false, nil
 	}
-	st := NodeState{
-		NodeID:      n.ID,
-		TenantID:    n.TenantID,
-		Weight:      n.Weight,
-		LastTouched: n.LastTouched,
-		AccessCount: n.AccessCount,
-	}
-	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges_out WHERE tenant=? AND from_id=?`, tenant, id).Scan(&st.EdgeCountOut); err != nil {
-		return NodeState{}, false, fmt.Errorf("inspect: count out edges: %w", err)
-	}
-	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges_in WHERE tenant=? AND to_id=?`, tenant, id).Scan(&st.EdgeCountIn); err != nil {
-		return NodeState{}, false, fmt.Errorf("inspect: count in edges: %w", err)
-	}
-	return st, true, nil
+	return *res.(*NodeState), true, nil
 }
 
-func gobDecode(b []byte, out any) error {
-	return gob.NewDecoder(bytes.NewReader(b)).Decode(out)
+func (r *Reader) read(ctx context.Context, fn func(tx neo4j.ManagedTransaction) (any, error)) (any, error) {
+	sess := r.driver.NewSession(ctx, neo4j.SessionConfig{
+		DatabaseName: r.database,
+		AccessMode:   neo4j.AccessModeRead,
+	})
+	defer sess.Close(ctx)
+	return sess.ExecuteRead(ctx, fn)
+}
+
+func decodeTupleJSON(raw string) map[string]string {
+	if raw == "" {
+		return nil
+	}
+	out := map[string]string{}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// asString / asInt64 / asFloat coerce bolt-driver results that may
+// arrive as multiple Go types (int / int64 / float32 / float64).
+
+func asString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func asInt64(v any) int64 {
+	switch x := v.(type) {
+	case int:
+		return int64(x)
+	case int64:
+		return x
+	case float64:
+		return int64(x)
+	}
+	return 0
+}
+
+func asFloat(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case float32:
+		return float64(x)
+	case int64:
+		return float64(x)
+	case int:
+		return float64(x)
+	}
+	return 0
 }

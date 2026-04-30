@@ -102,9 +102,17 @@ func (g graphAdapter) UpdateNode(ctx context.Context, tenant, id string, fn func
 
 func (g graphAdapter) DeleteNode(ctx context.Context, tenant, id string) error {
 	_, err := g.s.withWriteSession(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		// Read the node weight plus the count and weight-sum of every
+		// edge attached to it so we can drop them from the counter
+		// before the DETACH DELETE silently removes the relationships.
+		// An undirected pattern matches each attached edge exactly once
+		// (self-loops are forbidden, so no double-count risk).
 		r, err := tx.Run(ctx, `
 			MATCH (n:Node {tenant: $tenant, id: $id})
-			RETURN n.weight AS w
+			OPTIONAL MATCH (n)-[r:STRUCTURAL|CORETRIEVAL|COTRAVERSAL]-()
+			RETURN n.weight AS w,
+			       count(r) AS ec,
+			       coalesce(sum(r.weight), 0.0) AS esw
 		`, map[string]any{"tenant": tenant, "id": id})
 		if err != nil {
 			return nil, err
@@ -114,7 +122,12 @@ func (g graphAdapter) DeleteNode(ctx context.Context, tenant, id string) error {
 			return nil, nil // absent -> silent
 		}
 		wRaw, _ := rec.Get("w")
+		ecRaw, _ := rec.Get("ec")
+		eswRaw, _ := rec.Get("esw")
 		w := asFloat(wRaw)
+		ec := asInt64(ecRaw)
+		esw := asFloat(eswRaw)
+
 		if _, err := tx.Run(ctx, `
 			MATCH (n:Node {tenant: $tenant, id: $id})
 			DETACH DELETE n
@@ -124,6 +137,8 @@ func (g graphAdapter) DeleteNode(ctx context.Context, tenant, id string) error {
 		return nil, adjustCountersTx(ctx, tx, tenant, tenantCounters{
 			NodeCount:     -1,
 			SumNodeWeight: -w,
+			EdgeCount:     -ec,
+			SumEdgeWeight: -esw,
 		})
 	})
 	return err
@@ -251,9 +266,11 @@ func (g graphAdapter) PutEdge(ctx context.Context, e types.MemoryEdge) error {
 
 func (g graphAdapter) GetEdge(ctx context.Context, tenant, from, to string) (types.MemoryEdge, bool, error) {
 	res, err := g.s.withReadSession(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		// LIMIT 1: putEdgeTx enforces single-edge-per-pair, but a
+		// limit shields the read side against any historical drift.
 		r, err := tx.Run(ctx, `
 			MATCH (a:Node {tenant: $tenant, id: $from})-[r:STRUCTURAL|CORETRIEVAL|COTRAVERSAL]->(b:Node {tenant: $tenant, id: $to})
-			RETURN r, type(r) AS rel_type
+			RETURN r, type(r) AS rel_type LIMIT 1
 		`, map[string]any{"tenant": tenant, "from": from, "to": to})
 		if err != nil {
 			return nil, err
@@ -285,7 +302,7 @@ func (g graphAdapter) UpdateEdge(ctx context.Context, tenant, from, to string, f
 	_, err := g.s.withWriteSession(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		r, err := tx.Run(ctx, `
 			MATCH (a:Node {tenant: $tenant, id: $from})-[r:STRUCTURAL|CORETRIEVAL|COTRAVERSAL]->(b:Node {tenant: $tenant, id: $to})
-			RETURN r, type(r) AS rel_type
+			RETURN r, type(r) AS rel_type LIMIT 1
 		`, map[string]any{"tenant": tenant, "from": from, "to": to})
 		if err != nil {
 			return nil, err
@@ -300,22 +317,46 @@ func (g graphAdapter) UpdateEdge(ctx context.Context, tenant, from, to string, f
 		if !ok {
 			return nil, fmt.Errorf("neo4jstore: unexpected rel type %T", rRaw)
 		}
-		current := decodeEdgeProps(rel.Props, asString(typeRaw))
+		oldRelType := asString(typeRaw)
+		current := decodeEdgeProps(rel.Props, oldRelType)
 		current.From, current.To, current.TenantID = from, to, tenant
 		oldWeight := current.Weight
 		if err := fn(&current); err != nil {
 			return nil, err
 		}
-		// Edge type can't change in-place (Cypher rels are typed), so
-		// we forbid Kind drift on Update — just SET the mutable props.
+
+		// If the closure promoted the edge Kind (e.g. STRUCTURAL →
+		// CORETRIEVAL during Phase 5 of recall), Cypher's relType is
+		// immutable so we drop the old rel and create the new typed
+		// rel with the mutated props. The (from, to) endpoints stay.
+		newRelType := edgeKindRelType(current.Kind)
 		props := encodeEdgePropsForSet(current)
-		if _, err := tx.Run(ctx, `
-			MATCH (a:Node {tenant: $tenant, id: $from})-[r:STRUCTURAL|CORETRIEVAL|COTRAVERSAL]->(b:Node {tenant: $tenant, id: $to})
-			SET r += $props
-		`, map[string]any{
-			"tenant": tenant, "from": from, "to": to, "props": props,
-		}); err != nil {
-			return nil, err
+		if newRelType != oldRelType {
+			if _, err := tx.Run(ctx, `
+				MATCH (a:Node {tenant: $tenant, id: $from})-[r:STRUCTURAL|CORETRIEVAL|COTRAVERSAL]->(b:Node {tenant: $tenant, id: $to})
+				DELETE r
+			`, map[string]any{"tenant": tenant, "from": from, "to": to}); err != nil {
+				return nil, err
+			}
+			if _, err := tx.Run(ctx, fmt.Sprintf(`
+				MATCH (a:Node {tenant: $tenant, id: $from})
+				MATCH (b:Node {tenant: $tenant, id: $to})
+				MERGE (a)-[r:%s]->(b)
+				SET r += $props
+			`, newRelType), map[string]any{
+				"tenant": tenant, "from": from, "to": to, "props": props,
+			}); err != nil {
+				return nil, err
+			}
+		} else {
+			if _, err := tx.Run(ctx, `
+				MATCH (a:Node {tenant: $tenant, id: $from})-[r:STRUCTURAL|CORETRIEVAL|COTRAVERSAL]->(b:Node {tenant: $tenant, id: $to})
+				SET r += $props
+			`, map[string]any{
+				"tenant": tenant, "from": from, "to": to, "props": props,
+			}); err != nil {
+				return nil, err
+			}
 		}
 		return nil, adjustCountersTx(ctx, tx, tenant, tenantCounters{
 			SumEdgeWeight: current.Weight - oldWeight,
@@ -353,28 +394,54 @@ func (g graphAdapter) DeleteEdge(ctx context.Context, tenant, from, to string) e
 	return err
 }
 
-// putEdgeTx implements PutEdge inside an existing tx. Picks the
-// relationship type based on Kind, MERGEs the relationship between
-// existing nodes, sets all mutable properties.
+// putEdgeTx implements PutEdge inside an existing tx. memmy's
+// contract is one edge per (from, to) pair regardless of Kind, but
+// Cypher relationship types are part of the rel identity so storing
+// each Kind as a different relType would let two distinct rels share
+// one (from, to) pair — breaking that contract. We enforce
+// single-edge-per-pair at write time: any existing rel with a
+// different type is deleted before the requested type is MERGEd.
 func putEdgeTx(ctx context.Context, tx neo4j.ManagedTransaction, e types.MemoryEdge) error {
 	relType := edgeKindRelType(e.Kind)
-	r, err := tx.Run(ctx, fmt.Sprintf(`
-		MATCH (a:Node {tenant: $tenant, id: $from})-[r:%s]->(b:Node {tenant: $tenant, id: $to})
-		RETURN r.weight AS w
-	`, relType), map[string]any{
+
+	// Read the current state of any edge between these endpoints
+	// (regardless of relType) so we can update counters correctly
+	// when a same-pair, different-kind rel is being replaced.
+	r, err := tx.Run(ctx, `
+		MATCH (a:Node {tenant: $tenant, id: $from})-[r:STRUCTURAL|CORETRIEVAL|COTRAVERSAL]->(b:Node {tenant: $tenant, id: $to})
+		RETURN r.weight AS w, type(r) AS t
+	`, map[string]any{
 		"tenant": e.TenantID, "from": e.From, "to": e.To,
 	})
 	if err != nil {
 		return err
 	}
-	rec, err := r.Single(ctx)
 	var oldWeight float64
 	isNew := true
-	if err == nil {
+	oldRelType := ""
+	if r.Next(ctx) {
 		isNew = false
+		rec := r.Record()
 		wRaw, _ := rec.Get("w")
 		oldWeight = asFloat(wRaw)
+		tRaw, _ := rec.Get("t")
+		oldRelType = asString(tRaw)
 	}
+	if err := r.Err(); err != nil {
+		return err
+	}
+
+	// If the existing rel has a different Kind, drop it so MERGE
+	// below doesn't end up with two rels between the same pair.
+	if !isNew && oldRelType != relType {
+		if _, err := tx.Run(ctx, `
+			MATCH (a:Node {tenant: $tenant, id: $from})-[r:STRUCTURAL|CORETRIEVAL|COTRAVERSAL]->(b:Node {tenant: $tenant, id: $to})
+			DELETE r
+		`, map[string]any{"tenant": e.TenantID, "from": e.From, "to": e.To}); err != nil {
+			return err
+		}
+	}
+
 	// Both endpoints must exist as :Node before edge create. memmy's
 	// service guarantees this — Write inserts nodes before edges.
 	props := encodeEdgePropsForSet(e)

@@ -4,22 +4,24 @@ memmy is an LLM memory system written in Go (toolchain: **Go 1.26.2**), exposed 
 
 This document is the source of truth for architecture and design rationale. Code conventions live in `CLAUDE.md`.
 
+> **Storage layer note (Round 10).** memmy's reference backend is **Neo4j** via the Bolt protocol — the Hebbian memory graph and the HNSW navigation graph (Neo4j's native vector index) share one database. References to SQLite, `mattn/go-sqlite3`, an in-binary HNSW algorithm, the dual `edges_out` / `edges_in` mirror, or a per-tenant `HNSWMeta` blob in older parts of this document are pre-Round-10 and are kept for historical context. The interface contracts in §9 are unchanged; the implementation lives at `internal/storage/neo4j/`. See IMPLEMENTATION.md Round 10 for the migration summary.
+
 ---
 
 ## 0. Design Principles (load-bearing)
 
 These principles override convenience. If a section below appears to violate one of them, the section is wrong.
 
-1. **One source of truth: the database.** Vectors, nodes, messages, memory association edges, **and the HNSW navigation graph** all live in the configured storage backend. No secondary store, no external search engine, no parallel index file. The reference backend in v1 is SQLite (WAL mode, via the `mattn/go-sqlite3` CGO driver); the same logical data model maps to Postgres, MariaDB, Bigtable, Spanner, and other stores that satisfy the interface contracts in §9.
+1. **One source of truth: the database.** Vectors, nodes, messages, memory association edges, **and the HNSW navigation graph** all live in the configured storage backend. No secondary store, no external search engine, no parallel index file. The reference backend in v1 is **Neo4j** (Bolt protocol, native vector index, pure-Go driver `github.com/neo4j/neo4j-go-driver/v5`); the same logical data model maps to Postgres+pgvector, Aura, and other stores that satisfy the interface contracts in §9.
 
-2. **Storage is pluggable; retrieval policy is not.** Storage backends are interchangeable behind the `Graph` and `VectorIndex` interfaces. Retrieval scoring, oversampling, memory-edge reinforcement, lazy decay, and HNSW algorithm correctness live in the Memory Service and do not change per backend. Swapping the backend must not change observable retrieval behavior — only latency and operational characteristics.
+2. **Storage is pluggable; retrieval policy is not.** Storage backends are interchangeable behind the `Graph` and `VectorIndex` interfaces. Retrieval scoring, oversampling, memory-edge reinforcement, lazy decay, and vector-index correctness live in the Memory Service and do not change per backend. Swapping the backend must not change observable retrieval behavior — only latency and operational characteristics.
 
 3. **Stateless service.** A memmy process holds **no in-memory data state across requests**. The only persistent in-memory state in a memmy process is:
    - connection handles (storage backend, embedder, transport sessions to clients),
    - the loaded configuration (read-only),
    - process-local backpressure primitives (semaphores, rate limiters).
 
-   There are no caches of database content, no in-memory tenant registries, no in-memory vector indexes, no globally held weight or counter state, no shadow copies of `HNSWMeta`. Per-request transient state — priority queues, heaps, decoded vector buffers, visited-sets — is created and freed within the request's scope. This is a hard constraint, not an aspiration: it enables **horizontal scale-out via N stateless memmy nodes** against a shared multi-writer backend (Postgres, Bigtable, Spanner). The SQLite reference backend supports multi-process access through WAL mode (many readers + one writer at a time) — N memmy or library-embedded processes can share the same database file without coordination beyond SQLite's reserved-lock serialization.
+   There are no caches of database content, no in-memory tenant registries, no in-memory vector indexes, no globally held weight or counter state. Per-request transient state — priority queues, heaps, decoded vector buffers, visited-sets — is created and freed within the request's scope. This is a hard constraint, not an aspiration: it enables **horizontal scale-out via N stateless memmy nodes** against a shared multi-writer backend. The Neo4j reference backend supports many concurrent readers and writers via the Bolt driver pool — N memmy or library-embedded processes can share the same Neo4j database without coordination at the memmy layer.
 
 4. **Transport adapters wrap a single Memory Service.** All transports — MCP, gRPC, HTTP, future — call into one transport-agnostic `MemoryService` interface (§9). Transport-specific concerns (MCP tool registration, protobuf service definitions, HTTP route handlers) live in their adapters. The Memory Service does not know which transport invoked it.
 
@@ -37,7 +39,7 @@ These principles override convenience. If a section below appears to violate one
 - Persistent, associative memory for LLM agents.
 - Multi-tenant by arbitrary identity tuple.
 - **Pluggable** at every external boundary, behind Go interfaces:
-  - **Storage** v1: SQLite (WAL mode, `mattn/go-sqlite3`). Future: Postgres, MariaDB, Bigtable, Spanner, badger, pebble.
+  - **Storage** v1: Neo4j (Bolt protocol, native vector index, pure-Go driver). Future: Postgres+pgvector, Aura.
   - **Transport** v1: MCP via `github.com/modelcontextprotocol/go-sdk`. Future: gRPC + HTTP.
   - **Embedder** v1: Gemini via `go-genai`.
 - Memory association edges that **strengthen with use** (Hebbian) and **decay with disuse** (exponential).
@@ -86,8 +88,8 @@ These principles override convenience. If a section below appears to violate one
               │                  │                  │
         ┌─────▼─────┐      ┌─────▼──────────────────▼─────┐
         │ go-genai  │      │      Storage Backend          │
-        │ (Gemini)  │      │  sqlite | postgres | bigtable │
-        │           │      │  spanner | mariadb | …        │
+        │ (Gemini)  │      │  neo4j | postgres+pgvector |  │
+        │           │      │  aura | …                     │
         └───────────┘      └───────────────────────────────┘
 ```
 

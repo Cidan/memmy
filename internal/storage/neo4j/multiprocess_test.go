@@ -1,49 +1,27 @@
-package sqlitestore_test
+package neo4jstore_test
 
 import (
 	"context"
 	"fmt"
 	"math/rand/v2"
-	"path/filepath"
 	"testing"
 
-	sqlitestore "github.com/Cidan/memmy/internal/storage/sqlite"
+	"github.com/Cidan/memmy/internal/storage/neo4j/neo4jtest"
 	"github.com/Cidan/memmy/internal/types"
 )
 
-// TestMultiHandle_ConcurrentReadWrite proves the scenario the bbolt
-// backend could not satisfy: two *Storage handles open against the
-// same on-disk database simultaneously, with reads from handle B
-// observing writes committed via handle A. This is the property that
-// lets multiple processes (e.g. several `ask` instances) embed memmy
-// against the same DB without lock contention beyond the WAL writer
-// gate.
+// TestMultiHandle_ConcurrentReadWrite proves that two Storage handles
+// open against the same Neo4j database simultaneously can see each
+// other's writes — the property that lets multiple processes embed
+// memmy against the same db without lock contention. Bolt's session
+// model handles cross-handle visibility natively.
 func TestMultiHandle_ConcurrentReadWrite(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "memmy.db")
-
-	openHandle := func(seed uint64) *sqlitestore.Storage {
-		t.Helper()
-		st, err := sqlitestore.Open(sqlitestore.Options{
-			Path:     dbPath,
-			Dim:      8,
-			RandSeed: seed,
-		})
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
-		return st
-	}
-
-	stA := openHandle(11)
-	t.Cleanup(func() { _ = stA.Close() })
-	stB := openHandle(13)
-	t.Cleanup(func() { _ = stB.Close() })
+	stA, _, prefix := neo4jtest.Open(t, testDim)
+	stB, _, _ := neo4jtest.OpenSharedTenant(t, testDim, prefix)
 
 	ctx := context.Background()
-	tenant := "shared-tenant"
+	tenant := prefix
 
-	// Handle A inserts a node + vector; both writers can hold the file
-	// open simultaneously thanks to WAL.
 	r := rand.New(rand.NewPCG(1, 1))
 	const N = 5
 	ids := make([]string, N)
@@ -57,13 +35,14 @@ func TestMultiHandle_ConcurrentReadWrite(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("A.PutNode %s: %v", ids[i], err)
 		}
-		if err := stA.VectorIndex().Insert(ctx, tenant, ids[i], randVec(r, 8)); err != nil {
+		if err := stA.VectorIndex().Insert(ctx, tenant, ids[i], randVec(r, testDim)); err != nil {
 			t.Fatalf("A.Insert %s: %v", ids[i], err)
 		}
 	}
 
-	// Handle B reads each one back. Both handles point at the same file
-	// and SQLite WAL gives B a fresh snapshot that includes A's commits.
+	// Handle B reads each one back. Both handles point at the same
+	// database and Bolt gives B a fresh transaction snapshot that
+	// includes A's commits.
 	for _, id := range ids {
 		got, err := stB.Graph().GetNode(ctx, tenant, id)
 		if err != nil {
@@ -90,11 +69,11 @@ func TestMultiHandle_ConcurrentReadWrite(t *testing.T) {
 	}
 
 	// Searches succeed on both handles.
-	hitsA, err := stA.VectorIndex().Search(ctx, tenant, randVec(r, 8), 3)
+	hitsA, err := stA.VectorIndex().Search(ctx, tenant, randVec(r, testDim), 3)
 	if err != nil {
 		t.Fatalf("A.Search: %v", err)
 	}
-	hitsB, err := stB.VectorIndex().Search(ctx, tenant, randVec(r, 8), 3)
+	hitsB, err := stB.VectorIndex().Search(ctx, tenant, randVec(r, testDim), 3)
 	if err != nil {
 		t.Fatalf("B.Search: %v", err)
 	}

@@ -18,8 +18,6 @@ matrix:
   - name: high-reinforce
     overrides:
       NodeDelta: 2.5
-    hnsw:
-      EfSearch: 64
 `
 
 func TestLoad_AndOverrides(t *testing.T) {
@@ -53,18 +51,6 @@ func TestLoad_AndOverrides(t *testing.T) {
 	// Untouched field carried over from base.
 	if got.WeightCap != base.WeightCap {
 		t.Errorf("WeightCap=%v, want untouched %v", got.WeightCap, base.WeightCap)
-	}
-
-	hnswBase := memmy.DefaultHNSWConfig()
-	hnsw, err := sweep.ApplyHNSWOverrides(hnswBase, m.Entries[1].HNSW)
-	if err != nil {
-		t.Fatalf("ApplyHNSWOverrides: %v", err)
-	}
-	if hnsw.EfSearch != 64 {
-		t.Errorf("EfSearch=%v, want 64", hnsw.EfSearch)
-	}
-	if hnsw.M != hnswBase.M {
-		t.Errorf("M=%v, want untouched %v", hnsw.M, hnswBase.M)
 	}
 }
 

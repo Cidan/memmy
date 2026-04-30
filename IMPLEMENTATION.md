@@ -633,3 +633,59 @@ fell out of the manifest concurrent-writer test.
       `TestReplay_AdvancesClockToTurnTimestamps` from the prior round),
       cleaned up the now-unused `time` import that fell out of that
       deletion. Post-deslop regression re-run: clean.
+
+## Round 10 — Neo4j replaces SQLite end-to-end
+
+memmy migrates from SQLite (with hand-rolled HNSW) to Neo4j (Bolt protocol, native vector index + first-class graph). Schema bundled in the binary via `embed.FS`; migrations are explicit (`memmy migrate` subcommand; library exposes `memmy.Migrate(ctx, MigrationOptions{...})`). The `cmd/memmy` server is pure-Go (`CGO_ENABLED=0` works). The optional `cmd/memmy-eval` validation harness still imports `mattn/go-sqlite3` for its local data stores (`corpus.sqlite`, `embedcache.sqlite`, `queries.sqlite`); that's a tooling-only dependency, unrelated to memmy's runtime storage.
+
+### US-NEO-001 — Storage scaffold ✅
+- [x] `internal/storage/neo4j/{db,migrate,graph,vectorindex,counters,scanners,codec}.go` with the full Graph + VectorIndex port over the Bolt driver.
+- [x] `internal/storage/neo4j/migrations/{001_constraints,002_vector_index}.cypher` embedded via `embed.FS`. Migration system runs each statement in its own auto-commit (Neo4j forbids schema + data ops in one tx) and records applied versions on `:Migration` nodes.
+- [x] Two distinct graphs share the store: Hebbian memory edges (`STRUCTURAL` / `CORETRIEVAL` / `COTRAVERSAL` relationship types) and the native vector index (`node_embedding_idx` on `:Node(embedding)` with `cosine` similarity).
+
+### US-NEO-002 — Single-edge-per-pair invariant ✅
+- [x] memmy's contract is one edge per `(from, to)` regardless of `Kind`. Cypher relationship types are part of the rel identity, so `putEdgeTx` deletes any existing different-typed rel before MERGEing the requested type. `UpdateEdge` recreates the relationship with a new type when the closure promotes Kind (e.g. STRUCTURAL → CORETRIEVAL during Phase 5 of recall).
+
+### US-NEO-003 — Cosine semantics ✅
+- [x] Neo4j's `vector.similarity.cosine` returns `(1 + cos)/2 ∈ [0, 1]`; the VectorIndex contract is the standard cosine in `[-1, 1]`. The flat-scan and native-index paths both apply the inverse mapping (`2*sim - 1`) before returning, so the service layer's `simScore` math is unchanged from the SQLite era.
+
+### US-NEO-004 — Counter accuracy under DETACH DELETE ✅
+- [x] `DeleteNode` reads the count and weight-sum of every attached edge (undirected pattern, self-loops are forbidden so no double-count) and adjusts the per-tenant counter for them before the DETACH DELETE silently drops the rels.
+
+### US-NEO-005 — Test scaffolding ✅
+- [x] `internal/storage/neo4j/neo4jtest` exposes `Open(t, dim, opts...)`, `OpenSharedTenant(t, dim, prefix, opts...)`, `WithFlatScanThreshold(n)`, and `SkipIfUnset(t)`. Per-test tenant prefix; `t.Cleanup` DETACH DELETEs every Node/TenantInfo created under that prefix, matching both literal-prefix tenants (storage tests) and SHA-derived TenantIDs whose `tuple_json` mentions the prefix (service / harness tests). Tests skip cleanly when `NEO4J_PASSWORD` is unset.
+
+### US-NEO-006 — Library facade rewrite ✅
+- [x] `memmy.go` rewritten with `Options{Neo4jURI, Neo4jUser, Neo4jPassword, Neo4jDatabase, ConnectTimeout, Embedder, Clock, ServiceConfig, TenantSchema, FlatScanThreshold, SkipMigrationCheck}`. Schema-version guard at `Open` returns a remediation message pointing to `memmy.Migrate()`. New `MigrationOptions` + `Migrate(ctx, ...)` entry point.
+
+### US-NEO-007 — Config Neo4j-only ✅
+- [x] `internal/config/config.go` drops `SQLiteStorageConfig` and `HNSWParams`; `StorageConfig` now nests `Neo4jStorageConfig{URI, User, Password, Database, ConnectTimeout}`. `Default()` ships localhost defaults; `Validate()` enforces `Backend == "neo4j"` and required Neo4j fields. Password supports `${ENV_VAR}` expansion (also applied to `embedder.gemini.api_key`). `memmy.example.yaml` updated to the new shape.
+
+### US-NEO-008 — Cobra-driven CLI ✅
+- [x] `cmd/memmy/main.go` converted to cobra. `memmy serve --config <path>` (default if no subcommand) opens the service, schema-version-guards, registers transports under suture. `memmy migrate --config <path>` applies pending Cypher migrations and exits 0 on success. Removed the `bbolt` legacy-error branch — all backends except `neo4j` now error from `Validate`.
+
+### US-NEO-009 — Eval framework wiring ✅
+- [x] `internal/eval/inspect/inspect.go` rewritten as a Bolt-backed read-only window. New `inspect.Connection{URI, User, Password, Database}` is the unit threaded through `harness.ReplayOptions.Neo4j` and `harness.RunQueriesOptions.InspectConn`. `MemmyDBPath`, `HNSW`, and `HNSWRandSeed` fields are gone. The per-run baseline cache in `cmd/memmy-eval/run.go` is gone — Neo4j replay is fast enough that it's not a perf cliff.
+
+### US-NEO-010 — Sweep + manifest cleanup ✅
+- [x] `internal/eval/sweep/apply.go` drops `ApplyHNSWOverrides`. `Entry` drops the `HNSW` field. `cmd/memmy-eval/{run,sweep}.go` drop every HNSW reference and the `--hnsw-seed` / `--memmy-db` flags; Neo4j connection now reads from `NEO4J_*` env vars. `internal/eval/manifest/manifest.go` drops `HNSWConfigJSON` and `HNSWRandSeed` from `RunManifest`.
+
+### US-NEO-011 — Storage tests ✅
+- [x] `internal/storage/neo4j/{graph,counters,vectorindex,oracle,multiprocess}_test.go` ported from the SQLite suite. The oracle test enforces native-index recall@8 ≥ 0.85 vs flat-scan ground truth over 500×32-dim synthetic vectors (Neo4j's vector index is approximate — the recall floor is what matters, not the SQLite-HNSW exact numbers). Counters test runs 200 randomized ops against a brute-force shadow.
+
+### US-NEO-012 — Service / transport / library / eval tests ✅
+- [x] `internal/service/{service,reinforce}_test.go`, `internal/transport/mcp/mcp_test.go`, `memmy_test.go`, `internal/eval/inspect/{inspect,concurrency}_test.go`, `internal/eval/harness/{harness,replay_edge}_test.go`, `internal/eval/sweep/sweep_e2e_test.go` all migrated to `neo4jtest.Open`. Tenant tuples bake in the per-test prefix so the cleanup hook catches every row.
+
+### US-NEO-013 — SQLite removal (memmy storage layer) ✅
+- [x] `internal/storage/sqlite/` deleted. `mattn/go-sqlite3` is now imported only by the eval framework's local data stores (`internal/eval/{corpus,embedcache,queries}/`). The `cmd/memmy` server has no SQLite or CGO dependency.
+
+### US-NEO-014 — Documentation ✅
+- [x] `README.md`: setup section now documents Neo4j install (Docker / brew / Desktop), `memmy migrate` workflow, `NEO4J_*` env vars for tests, pure-Go build (no CGO).
+- [x] `memmy.example.yaml`: `storage.neo4j.{uri,user,password,database,connect_timeout}` block; `vector_index.hnsw` knobs gone (Neo4j has no exposed HNSW tunables).
+- [x] `IMPLEMENTATION.md`: this Round 10 entry.
+
+### US-NEO-015 — Final regression ✅
+- [x] `NEO4J_PASSWORD=… go vet ./...` clean
+- [x] `NEO4J_PASSWORD=… go build ./...` clean
+- [x] `NEO4J_PASSWORD=… go test ./...` 214 tests pass across 25 packages.
+- [x] End-to-end smoke: `memmy migrate --config memmy.example.yaml` then `memmy serve --config memmy.example.yaml` against the local Neo4j succeeds.

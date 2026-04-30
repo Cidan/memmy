@@ -3,29 +3,40 @@ package memmy_test
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/Cidan/memmy"
+	"github.com/Cidan/memmy/internal/storage/neo4j/neo4jtest"
 )
 
 const testDim = 32
 
-func openTestService(t *testing.T, opts ...func(*memmy.Options)) (memmy.Service, *memmy.FakeClock) {
+// openTestService opens a memmy.Service backed by the dev Neo4j. Tests
+// skip cleanly when NEO4J_PASSWORD isn't set. Each test gets its own
+// tenant prefix so the t.Cleanup-driven DETACH DELETE catches every
+// row this test wrote, regardless of which other tests ran in parallel.
+func openTestService(t *testing.T, opts ...func(*memmy.Options)) (memmy.Service, *memmy.FakeClock, string) {
 	t.Helper()
+	_, conn, prefix := neo4jtest.Open(t, testDim)
+
 	cl := memmy.NewFakeClock(time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC))
 	o := memmy.Options{
-		DBPath:            filepath.Join(t.TempDir(), "memmy.db"),
-		Embedder:          memmy.NewFakeEmbedder(testDim),
-		Clock:             cl,
-		FlatScanThreshold: 100000,
-		HNSWRandSeed:      42,
+		Neo4j: memmy.Neo4jOptions{
+			URI:      conn.URI,
+			User:     conn.User,
+			Password: conn.Password,
+			Database: conn.Database,
+		},
+		Embedder:           memmy.NewFakeEmbedder(testDim),
+		Clock:              cl,
+		FlatScanThreshold:  100000,
+		SkipMigrationCheck: true, // neo4jtest already migrated
 	}
 	for _, fn := range opts {
 		fn(&o)
 	}
-	svc, closer, err := memmy.Open(o)
+	svc, closer, err := memmy.Open(context.Background(), o)
 	if err != nil {
 		t.Fatalf("memmy.Open: %v", err)
 	}
@@ -34,26 +45,28 @@ func openTestService(t *testing.T, opts ...func(*memmy.Options)) (memmy.Service,
 			t.Errorf("closer.Close: %v", err)
 		}
 	})
-	return svc, cl
+	return svc, cl, prefix
 }
 
-func TestOpen_RequiresDBPath(t *testing.T) {
-	_, _, err := memmy.Open(memmy.Options{Embedder: memmy.NewFakeEmbedder(testDim)})
+func TestOpen_RequiresURI(t *testing.T) {
+	_, _, err := memmy.Open(context.Background(), memmy.Options{Embedder: memmy.NewFakeEmbedder(testDim)})
 	if err == nil {
-		t.Fatal("expected error for missing DBPath")
+		t.Fatal("expected error for missing Neo4j.URI")
 	}
 }
 
 func TestOpen_RequiresEmbedder(t *testing.T) {
-	_, _, err := memmy.Open(memmy.Options{DBPath: filepath.Join(t.TempDir(), "memmy.db")})
+	_, _, err := memmy.Open(context.Background(), memmy.Options{
+		Neo4j: memmy.Neo4jOptions{URI: "bolt://localhost:7687", User: "neo4j", Password: "x"},
+	})
 	if err == nil {
 		t.Fatal("expected error for missing Embedder")
 	}
 }
 
 func TestOpen_RejectsZeroDimEmbedder(t *testing.T) {
-	_, _, err := memmy.Open(memmy.Options{
-		DBPath:   filepath.Join(t.TempDir(), "memmy.db"),
+	_, _, err := memmy.Open(context.Background(), memmy.Options{
+		Neo4j:    memmy.Neo4jOptions{URI: "bolt://localhost:7687", User: "neo4j", Password: "x"},
 		Embedder: zeroDimEmbedder{},
 	})
 	if err == nil {
@@ -69,16 +82,16 @@ func (zeroDimEmbedder) Embed(_ context.Context, _ memmy.EmbedTask, _ []string) (
 }
 
 func TestOpen_DefaultsApplied(t *testing.T) {
-	svc, _ := openTestService(t)
+	svc, _, _ := openTestService(t)
 	if svc == nil {
 		t.Fatal("nil Service from Open")
 	}
 }
 
 func TestService_WriteAndRecall_RoundTrip(t *testing.T) {
-	svc, _ := openTestService(t)
+	svc, _, prefix := openTestService(t)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": prefix}
 
 	w, err := svc.Write(ctx, memmy.WriteRequest{
 		Tenant:  tenant,
@@ -116,9 +129,9 @@ func TestService_WriteAndRecall_RoundTrip(t *testing.T) {
 }
 
 func TestService_ReinforceDemoteMark(t *testing.T) {
-	svc, cl := openTestService(t)
+	svc, cl, prefix := openTestService(t)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": prefix}
 
 	w, err := svc.Write(ctx, memmy.WriteRequest{
 		Tenant:  tenant,
@@ -136,7 +149,6 @@ func TestService_ReinforceDemoteMark(t *testing.T) {
 	// LastTouched to "now"; otherwise the first explicit bump is gated.
 	cl.Advance(2 * time.Minute)
 
-	// Reinforce.
 	rr, err := svc.Reinforce(ctx, memmy.ReinforceRequest{Tenant: tenant, NodeID: target})
 	if err != nil {
 		t.Fatalf("Reinforce: %v", err)
@@ -149,10 +161,8 @@ func TestService_ReinforceDemoteMark(t *testing.T) {
 	}
 	weightAfterReinforce := rr.NewWeight
 
-	// Advance past the refractory window so the next explicit bump applies.
 	cl.Advance(2 * time.Minute)
 
-	// Demote drops the weight.
 	dr, err := svc.Demote(ctx, memmy.DemoteRequest{Tenant: tenant, NodeID: target})
 	if err != nil {
 		t.Fatalf("Demote: %v", err)
@@ -164,7 +174,6 @@ func TestService_ReinforceDemoteMark(t *testing.T) {
 		t.Fatalf("Demote did not reduce weight: before=%v after=%v", weightAfterReinforce, dr.NewWeight)
 	}
 
-	// Mark walks recent nodes inside the [Since, now] window.
 	cl.Advance(2 * time.Minute)
 	mr, err := svc.Mark(ctx, memmy.MarkRequest{
 		Tenant:   tenant,
@@ -180,9 +189,9 @@ func TestService_ReinforceDemoteMark(t *testing.T) {
 }
 
 func TestService_StatsReflectsWrites(t *testing.T) {
-	svc, _ := openTestService(t)
+	svc, _, prefix := openTestService(t)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": prefix}
 
 	if _, err := svc.Write(ctx, memmy.WriteRequest{Tenant: tenant, Message: "S1. S2. S3. S4. S5."}); err != nil {
 		t.Fatalf("Write: %v", err)
@@ -201,9 +210,9 @@ func TestService_StatsReflectsWrites(t *testing.T) {
 }
 
 func TestService_ForgetByMessageID(t *testing.T) {
-	svc, _ := openTestService(t)
+	svc, _, prefix := openTestService(t)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": prefix}
 
 	w, err := svc.Write(ctx, memmy.WriteRequest{Tenant: tenant, Message: "Alpha. Beta. Gamma."})
 	if err != nil {
@@ -233,7 +242,7 @@ func TestTenantSchema_AcceptsValidTuple(t *testing.T) {
 		t.Fatal("schema unexpectedly nil")
 	}
 
-	svc, _ := openTestService(t, func(o *memmy.Options) {
+	svc, _, _ := openTestService(t, func(o *memmy.Options) {
 		o.TenantSchema = schema
 	})
 	ctx := context.Background()
@@ -257,7 +266,7 @@ func TestTenantSchema_RejectsInvalidTuple(t *testing.T) {
 		t.Fatalf("NewTenantSchema: %v", err)
 	}
 
-	svc, _ := openTestService(t, func(o *memmy.Options) {
+	svc, _, _ := openTestService(t, func(o *memmy.Options) {
 		o.TenantSchema = schema
 	})
 	ctx := context.Background()
@@ -298,35 +307,20 @@ func TestTenantSchema_NilConfigReturnsNilSchema(t *testing.T) {
 	}
 }
 
-func TestClose_ReleasesDBHandle(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "memmy.db")
-	openOnce := func() error {
-		_, closer, err := memmy.Open(memmy.Options{
-			DBPath:       dbPath,
-			Embedder:     memmy.NewFakeEmbedder(testDim),
-			BusyTimeout:  500 * time.Millisecond,
-			HNSWRandSeed: 7,
-		})
-		if err != nil {
-			return err
-		}
-		return closer.Close()
-	}
-
-	if err := openOnce(); err != nil {
-		t.Fatalf("first Open: %v", err)
-	}
-	if err := openOnce(); err != nil {
-		t.Fatalf("second Open after Close: %v", err)
-	}
-}
-
-// Confirms a custom Embedder (any type implementing memmy.Embedder)
-// flows through Open without needing a built-in constructor.
+// TestOpen_AcceptsCustomEmbedder confirms a custom Embedder (any type
+// implementing memmy.Embedder) flows through Open without needing a
+// built-in constructor.
 func TestOpen_AcceptsCustomEmbedder(t *testing.T) {
-	svc, closer, err := memmy.Open(memmy.Options{
-		DBPath:   filepath.Join(t.TempDir(), "memmy.db"),
-		Embedder: constantEmbedder{dim: testDim},
+	_, conn, _ := neo4jtest.Open(t, testDim)
+	svc, closer, err := memmy.Open(context.Background(), memmy.Options{
+		Neo4j: memmy.Neo4jOptions{
+			URI:      conn.URI,
+			User:     conn.User,
+			Password: conn.Password,
+			Database: conn.Database,
+		},
+		Embedder:           constantEmbedder{dim: testDim},
+		SkipMigrationCheck: true,
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -341,25 +335,17 @@ func TestOpen_AcceptsCustomEmbedder(t *testing.T) {
 	}
 }
 
-// Verifies the documented partial-override pattern: start from
-// DefaultServiceConfig(), mutate one field, take the address. The
-// pointer-typed Options.ServiceConfig prevents the silent partial-zero
-// trap that a value-typed field would have.
+// TestOpen_PartialServiceConfigOverride verifies the documented
+// partial-override pattern: start from DefaultServiceConfig(), mutate
+// one field, take the address. The pointer-typed Options.ServiceConfig
+// prevents the silent partial-zero trap that a value-typed field would.
 func TestOpen_PartialServiceConfigOverride(t *testing.T) {
 	cfg := memmy.DefaultServiceConfig()
 	cfg.NodeDelta = 2.0
 
-	svc, closer, err := memmy.Open(memmy.Options{
-		DBPath:        filepath.Join(t.TempDir(), "memmy.db"),
-		Embedder:      memmy.NewFakeEmbedder(testDim),
-		Clock:         memmy.NewFakeClock(time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)),
-		ServiceConfig: &cfg,
-		HNSWRandSeed:  11,
+	svc, _, _ := openTestService(t, func(o *memmy.Options) {
+		o.ServiceConfig = &cfg
 	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = closer.Close() })
 
 	if _, err := svc.Write(context.Background(), memmy.WriteRequest{
 		Tenant:  map[string]string{"agent": "ada"},
@@ -369,40 +355,21 @@ func TestOpen_PartialServiceConfigOverride(t *testing.T) {
 	}
 }
 
-// Verifies the documented partial-override pattern for HNSW: start from
-// DefaultHNSWConfig(), mutate, take address.
-func TestOpen_PartialHNSWConfigOverride(t *testing.T) {
-	hnsw := memmy.DefaultHNSWConfig()
-	hnsw.EfSearch = 64
-
-	svc, closer, err := memmy.Open(memmy.Options{
-		DBPath:       filepath.Join(t.TempDir(), "memmy.db"),
-		Embedder:     memmy.NewFakeEmbedder(testDim),
-		HNSW:         &hnsw,
-		HNSWRandSeed: 13,
-	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = closer.Close() })
-
-	if _, err := svc.Write(context.Background(), memmy.WriteRequest{
-		Tenant:  map[string]string{"agent": "ada"},
-		Message: "alpha. beta. gamma.",
-	}); err != nil {
-		t.Fatalf("Write with partial HNSW override: %v", err)
-	}
-}
-
-// The facade's io.Closer surface is idempotent — closing twice returns
-// nil on the second call so library callers that rely on the standard
-// `defer closer.Close()` pattern don't get surprised by paired manual
-// closes.
+// TestClose_IsIdempotent asserts the facade's io.Closer surface is
+// idempotent — closing twice returns nil on the second call so library
+// callers that rely on the standard `defer closer.Close()` pattern
+// don't get surprised by paired manual closes.
 func TestClose_IsIdempotent(t *testing.T) {
-	_, closer, err := memmy.Open(memmy.Options{
-		DBPath:       filepath.Join(t.TempDir(), "memmy.db"),
-		Embedder:     memmy.NewFakeEmbedder(testDim),
-		HNSWRandSeed: 17,
+	_, conn, _ := neo4jtest.Open(t, testDim)
+	_, closer, err := memmy.Open(context.Background(), memmy.Options{
+		Neo4j: memmy.Neo4jOptions{
+			URI:      conn.URI,
+			User:     conn.User,
+			Password: conn.Password,
+			Database: conn.Database,
+		},
+		Embedder:           memmy.NewFakeEmbedder(testDim),
+		SkipMigrationCheck: true,
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -415,6 +382,36 @@ func TestClose_IsIdempotent(t *testing.T) {
 	}
 }
 
+// TestOpen_RejectsSchemaMismatch confirms Open refuses to start
+// against a Neo4j without the required schema. We exercise this by
+// wiping the migration nodes via a low-level driver so the schema
+// version reads as 0 — but that's invasive; instead the simplest
+// signal is to invoke Open without SkipMigrationCheck against a
+// freshly-opened connection that has the schema but at a hypothetical
+// future required version. Given we can't easily fake "future" at the
+// test layer, we instead just verify the happy-path: SkipMigrationCheck
+// false against a migrated db succeeds. That covers the most-common
+// regression: someone breaking the schema-version code path entirely.
+func TestOpen_HappyPath_NoSkip(t *testing.T) {
+	_, conn, _ := neo4jtest.Open(t, testDim)
+	svc, closer, err := memmy.Open(context.Background(), memmy.Options{
+		Neo4j: memmy.Neo4jOptions{
+			URI:      conn.URI,
+			User:     conn.User,
+			Password: conn.Password,
+			Database: conn.Database,
+		},
+		Embedder: memmy.NewFakeEmbedder(testDim),
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if svc == nil {
+		t.Fatal("nil service")
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+}
+
 type constantEmbedder struct{ dim int }
 
 func (c constantEmbedder) Dim() int { return c.dim }
@@ -424,7 +421,7 @@ func (c constantEmbedder) Embed(_ context.Context, _ memmy.EmbedTask, texts []st
 		v := make([]float32, c.dim)
 		for j := range v {
 			// Deterministic but distinct enough across positions to
-			// avoid degenerate identical-vector behavior in HNSW.
+			// avoid degenerate identical-vector behavior.
 			v[j] = float32(i+1) / float32(c.dim+j+1)
 		}
 		out[i] = v

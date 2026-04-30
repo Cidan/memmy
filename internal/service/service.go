@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -36,13 +37,14 @@ type MemoryService interface {
 
 // Service is the concrete MemoryService implementation.
 type Service struct {
-	graph    graph.Graph
-	vidx     vectorindex.VectorIndex
-	embedder embed.Embedder
-	clock    clock.Clock
-	cfg      Config
-	entropy  *ulid.MonotonicEntropy
-	schema   *TenantSchema // nil → accept any tuple
+	graph      graph.Graph
+	vidx       vectorindex.VectorIndex
+	embedder   embed.Embedder
+	clock      clock.Clock
+	cfg        Config
+	entropy    *ulid.MonotonicEntropy
+	entropyMu  sync.Mutex // guards entropy: ulid.MonotonicEntropy is not goroutine-safe
+	schema     *TenantSchema // nil → accept any tuple
 }
 
 // Config bundles the tunables for chunking, retrieval, decay, and
@@ -167,9 +169,15 @@ func (s *Service) Schema() *TenantSchema { return s.schema }
 // a process-monotonic entropy source for the random bits. ULIDs are
 // lex-sortable AND chronologically sortable, which lets us scan recent
 // nodes by time via a simple cursor.
+//
+// ulid.MonotonicEntropy is not goroutine-safe; the mutex serializes
+// concurrent newID callers. Allocations would only spread contention
+// across instances, not avoid it, so a mutex is the cheapest fix.
 func (s *Service) newID() string {
 	t := s.clock.Now()
+	s.entropyMu.Lock()
 	id, err := ulid.New(uint64(t.UnixMilli()), s.entropy)
+	s.entropyMu.Unlock()
 	if err != nil {
 		// MonotonicEntropy can fail if the clock goes backwards; in that
 		// case we fall back to crypto/rand and the original time.

@@ -13,7 +13,7 @@ import (
 func TestService_Reinforce_BumpsWeight(t *testing.T) {
 	f := newFixture(t, 32)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 	tenantID := types.TenantID(tenant)
 
 	res, err := f.svc.Write(ctx, types.WriteRequest{
@@ -53,7 +53,7 @@ func TestService_Reinforce_BumpsWeight(t *testing.T) {
 func TestService_Reinforce_RefractoryBlocksRepeatedCalls(t *testing.T) {
 	f := newFixture(t, 32)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 
 	res, err := f.svc.Write(ctx, types.WriteRequest{
 		Tenant: tenant, Message: "alpha. beta. gamma.",
@@ -115,7 +115,7 @@ func TestService_Reinforce_LogDampeningNearCap(t *testing.T) {
 		c.LogDampening = true
 	})
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 	tenantID := types.TenantID(tenant)
 
 	res, err := f.svc.Write(ctx, types.WriteRequest{
@@ -163,7 +163,7 @@ func TestService_Reinforce_LogDampeningOffMatchesNodeDelta(t *testing.T) {
 		c.LogDampening = false
 	})
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 	tenantID := types.TenantID(tenant)
 
 	res, err := f.svc.Write(ctx, types.WriteRequest{
@@ -202,7 +202,7 @@ func TestService_Demote_ClampsAtNodeFloor(t *testing.T) {
 		c.NodeFloor = 0.05
 	})
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 	tenantID := types.TenantID(tenant)
 
 	res, err := f.svc.Write(ctx, types.WriteRequest{
@@ -251,7 +251,7 @@ func TestService_Mark_BoostsRecentWindow(t *testing.T) {
 		c.RefractoryPeriod = 0
 	})
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 	tenantID := types.TenantID(tenant)
 
 	// Older message — created BEFORE the mark window.
@@ -333,7 +333,7 @@ func TestService_Mark_BoostsRecentWindow(t *testing.T) {
 func TestService_Mark_RefractorySkipsRecentlyTouched(t *testing.T) {
 	f := newFixture(t, 32) // default RefractoryPeriod=60s
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 
 	windowStart := f.cl.Now()
 	// Open a wide window before any writes, so recency factor is well
@@ -395,7 +395,7 @@ func TestService_Demote_UnknownNodeReturnsError(t *testing.T) {
 func TestService_Mark_RejectsBadInputs(t *testing.T) {
 	f := newFixture(t, 32)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 
 	if _, err := f.svc.Mark(ctx, types.MarkRequest{
 		Tenant: tenant, Since: time.Time{}, Strength: 1.0,

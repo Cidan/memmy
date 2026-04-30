@@ -16,15 +16,20 @@ server:
       enabled: false
 
 storage:
-  # SQLite (WAL mode) is the v1 reference backend. WAL coordination
-  # lets multiple host processes share one DB file: many readers + one
-  # writer at a time. SQLite stores `-wal` and `-shm` sidecar files
-  # alongside `path` while the database is open.
-  backend: sqlite
-  sqlite:
-    path: "./data/memmy.db"
-    # busy_timeout: 5s   # how long blocked writers wait for the
-                          # reserved lock; 0 → 5s default.
+  # Neo4j (Bolt protocol, native vector index) is the v1 reference
+  # backend. Multiple memmy processes can share one Neo4j instance —
+  # the bolt driver pool handles concurrent reads and writes natively.
+  # The schema is bundled in the binary; run `memmy migrate --config
+  # <path>` once before `memmy serve` to apply it.
+  backend: neo4j
+  neo4j:
+    uri: bolt://localhost:7687
+    user: neo4j
+    # ${ENV_VAR} expansion is supported here; the literal string
+    # otherwise. Avoid checking real passwords into source control.
+    password: ${NEO4J_PASSWORD}
+    database: neo4j
+    connect_timeout: 10s
 
 embedder:
   # Set backend to "gemini" for production.
@@ -50,13 +55,9 @@ embedder:
     concurrency: 8
 
 vector_index:
+  # Per-tenant size below which Recall uses a Cypher flat scan instead
+  # of the native vector index. Tiny tenants pay zero index overhead.
   flat_scan_threshold: 5000
-  hnsw:
-    m: 16
-    m0: 32
-    ef_construction: 200
-    ef_search: 100
-    ml: 0.36
 
 memory:
   chunk_window_size: 3

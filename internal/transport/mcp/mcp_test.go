@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,23 +14,15 @@ import (
 	"github.com/Cidan/memmy/internal/config"
 	"github.com/Cidan/memmy/internal/embed/fake"
 	"github.com/Cidan/memmy/internal/service"
-	sqlitestore "github.com/Cidan/memmy/internal/storage/sqlite"
+	"github.com/Cidan/memmy/internal/storage/neo4j/neo4jtest"
 	mcpadapter "github.com/Cidan/memmy/internal/transport/mcp"
 )
 
-// connect builds a real SQLite-backed MemoryService, wraps it in an
+// connect builds a real Neo4j-backed MemoryService, wraps it in an
 // MCP adapter, and returns an in-process MCP client session.
 func connect(t *testing.T) *mcpsdk.ClientSession {
 	t.Helper()
-	store, err := sqlitestore.Open(sqlitestore.Options{
-		Path: filepath.Join(t.TempDir(), "memmy.db"),
-		Dim:  32, RandSeed: 42,
-		FlatScanThreshold: 100000,
-	})
-	if err != nil {
-		t.Fatalf("storage: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
+	store, _, _ := neo4jtest.Open(t, 32, neo4jtest.WithFlatScanThreshold(100000))
 
 	svc, err := service.New(
 		store.Graph(), store.VectorIndex(),
@@ -84,15 +75,7 @@ func TestMCP_ToolList(t *testing.T) {
 // to escape the refractory window or advance Mark windows.
 func connectWithFixture(t *testing.T) (*mcpsdk.ClientSession, *clock.Fake) {
 	t.Helper()
-	store, err := sqlitestore.Open(sqlitestore.Options{
-		Path: filepath.Join(t.TempDir(), "memmy.db"),
-		Dim:  32, RandSeed: 42,
-		FlatScanThreshold: 100000,
-	})
-	if err != nil {
-		t.Fatalf("storage: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
+	store, _, _ := neo4jtest.Open(t, 32, neo4jtest.WithFlatScanThreshold(100000))
 
 	cl := clock.NewFake(time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC))
 
@@ -402,15 +385,7 @@ func TestMCP_Stats(t *testing.T) {
 // schema rendering and corrective error round-tripping.
 func connectWithSchema(t *testing.T, schema *service.TenantSchema) *mcpsdk.ClientSession {
 	t.Helper()
-	store, err := sqlitestore.Open(sqlitestore.Options{
-		Path: filepath.Join(t.TempDir(), "memmy.db"),
-		Dim:  32, RandSeed: 42,
-		FlatScanThreshold: 100000,
-	})
-	if err != nil {
-		t.Fatalf("storage: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
+	store, _, _ := neo4jtest.Open(t, 32, neo4jtest.WithFlatScanThreshold(100000))
 
 	svc, err := service.New(
 		store.Graph(), store.VectorIndex(),
@@ -617,15 +592,7 @@ func TestMCP_TenantSchema_DescriptionRendersIntoToolListing(t *testing.T) {
 }
 
 func TestMCP_RunTransport_StdioCodePath(t *testing.T) {
-	store, err := sqlitestore.Open(sqlitestore.Options{
-		Path: filepath.Join(t.TempDir(), "memmy.db"),
-		Dim:  32, RandSeed: 42,
-		FlatScanThreshold: 100000,
-	})
-	if err != nil {
-		t.Fatalf("storage: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
+	store, _, _ := neo4jtest.Open(t, 32, neo4jtest.WithFlatScanThreshold(100000))
 
 	svc, err := service.New(
 		store.Graph(), store.VectorIndex(),

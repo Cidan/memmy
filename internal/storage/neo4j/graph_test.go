@@ -1,4 +1,4 @@
-package sqlitestore_test
+package neo4jstore_test
 
 import (
 	"context"
@@ -8,22 +8,25 @@ import (
 	"time"
 
 	gport "github.com/Cidan/memmy/internal/graph"
+	"github.com/Cidan/memmy/internal/storage/neo4j/neo4jtest"
 	"github.com/Cidan/memmy/internal/types"
 )
 
+const testDim = 32
+
 func TestGraph_NodeCRUD(t *testing.T) {
-	st := openTestStorage(t, 8)
+	st, _, prefix := neo4jtest.Open(t, testDim)
 	g := st.Graph()
 	ctx := context.Background()
 
-	tenant := "tenant-a"
+	tenant := prefix
 	n := types.Node{
 		ID:           "node-1",
 		TenantID:     tenant,
 		SourceMsgID:  "msg-1",
 		SentenceSpan: [2]int{0, 3},
 		Text:         "hello world",
-		EmbeddingDim: 8,
+		EmbeddingDim: testDim,
 		CreatedAt:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 		LastTouched:  time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 		Weight:       1.0,
@@ -61,19 +64,19 @@ func TestGraph_NodeCRUD(t *testing.T) {
 }
 
 func TestGraph_NodeUpdate_NotFound(t *testing.T) {
-	st := openTestStorage(t, 8)
+	st, _, prefix := neo4jtest.Open(t, testDim)
 	g := st.Graph()
-	err := g.UpdateNode(context.Background(), "t", "missing", func(*types.Node) error { return nil })
+	err := g.UpdateNode(context.Background(), prefix, "missing", func(*types.Node) error { return nil })
 	if !errors.Is(err, gport.ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }
 
 func TestGraph_Message(t *testing.T) {
-	st := openTestStorage(t, 8)
+	st, _, prefix := neo4jtest.Open(t, testDim)
 	g := st.Graph()
 	ctx := context.Background()
-	tenant := "tenant-a"
+	tenant := prefix
 
 	m := types.Message{
 		ID:        "msg-1",
@@ -94,12 +97,24 @@ func TestGraph_Message(t *testing.T) {
 	}
 }
 
-func TestGraph_Edge_DualMirrorAtomic(t *testing.T) {
-	st := openTestStorage(t, 8)
+// TestGraph_Edge_DirectionalAtomic exercises the relationship's
+// outbound + inbound traversal contract: a single :STRUCTURAL rel
+// from a→b must be reachable both via Neighbors(a) (outbound) and
+// InboundNeighbors(b) (inbound). No "dual mirror" rows in Neo4j —
+// the relationship itself is the source of truth — so the test
+// confirms the relationship's view stays consistent under mutation.
+func TestGraph_Edge_DirectionalAtomic(t *testing.T) {
+	st, _, prefix := neo4jtest.Open(t, testDim)
 	g := st.Graph()
 	ctx := context.Background()
-	tenant := "tenant-a"
+	tenant := prefix
 
+	// Endpoints must exist before edges per service-layer contract.
+	for _, id := range []string{"a", "b"} {
+		if err := g.PutNode(ctx, types.Node{ID: id, TenantID: tenant, Weight: 1}); err != nil {
+			t.Fatalf("PutNode %s: %v", id, err)
+		}
+	}
 	e := types.MemoryEdge{
 		From:        "a",
 		To:          "b",
@@ -156,15 +171,20 @@ func TestGraph_Edge_DualMirrorAtomic(t *testing.T) {
 }
 
 func TestGraph_Edge_GetEdge(t *testing.T) {
-	st := openTestStorage(t, 8)
+	st, _, prefix := neo4jtest.Open(t, testDim)
 	g := st.Graph()
 	ctx := context.Background()
-	tenant := "tenant-a"
+	tenant := prefix
 
 	if _, ok, err := g.GetEdge(ctx, tenant, "x", "y"); err != nil || ok {
 		t.Fatalf("missing edge: ok=%v err=%v", ok, err)
 	}
 
+	for _, id := range []string{"x", "y"} {
+		if err := g.PutNode(ctx, types.Node{ID: id, TenantID: tenant, Weight: 1}); err != nil {
+			t.Fatalf("PutNode %s: %v", id, err)
+		}
+	}
 	e := types.MemoryEdge{From: "x", To: "y", TenantID: tenant, Weight: 1, Kind: types.EdgeCoRetrieval}
 	if err := g.PutEdge(ctx, e); err != nil {
 		t.Fatal(err)
@@ -179,29 +199,34 @@ func TestGraph_Edge_GetEdge(t *testing.T) {
 }
 
 func TestGraph_Edge_UpdateEdge_NotFound(t *testing.T) {
-	st := openTestStorage(t, 8)
+	st, _, prefix := neo4jtest.Open(t, testDim)
 	g := st.Graph()
-	err := g.UpdateEdge(context.Background(), "t", "a", "b", func(*types.MemoryEdge) error { return nil })
+	err := g.UpdateEdge(context.Background(), prefix, "a", "b", func(*types.MemoryEdge) error { return nil })
 	if !errors.Is(err, gport.ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }
 
 func TestGraph_Edge_RejectsSelfLoop(t *testing.T) {
-	st := openTestStorage(t, 8)
+	st, _, prefix := neo4jtest.Open(t, testDim)
 	g := st.Graph()
-	err := g.PutEdge(context.Background(), types.MemoryEdge{From: "a", To: "a", TenantID: "t"})
+	err := g.PutEdge(context.Background(), types.MemoryEdge{From: "a", To: "a", TenantID: prefix})
 	if err == nil {
 		t.Fatal("expected error for self-loop")
 	}
 }
 
 func TestGraph_Neighbors_MultipleEdges(t *testing.T) {
-	st := openTestStorage(t, 8)
+	st, _, prefix := neo4jtest.Open(t, testDim)
 	g := st.Graph()
 	ctx := context.Background()
-	tenant := "tenant-a"
+	tenant := prefix
 
+	for _, id := range []string{"a", "b", "c", "d"} {
+		if err := g.PutNode(ctx, types.Node{ID: id, TenantID: tenant, Weight: 1}); err != nil {
+			t.Fatalf("PutNode %s: %v", id, err)
+		}
+	}
 	for _, to := range []string{"b", "c", "d"} {
 		err := g.PutEdge(ctx, types.MemoryEdge{From: "a", To: to, TenantID: tenant, Weight: 1})
 		if err != nil {
@@ -226,15 +251,16 @@ func TestGraph_Neighbors_MultipleEdges(t *testing.T) {
 }
 
 func TestGraph_Tenants(t *testing.T) {
-	st := openTestStorage(t, 8)
+	st, _, prefix := neo4jtest.Open(t, testDim)
 	g := st.Graph()
 	ctx := context.Background()
 
-	if _, err := g.GetTenant(ctx, "missing"); !errors.Is(err, gport.ErrNotFound) {
+	if _, err := g.GetTenant(ctx, prefix+"_missing"); !errors.Is(err, gport.ErrNotFound) {
 		t.Fatalf("missing tenant err = %v", err)
 	}
 
-	for _, id := range []string{"t-a", "t-b", "t-c"} {
+	want := []string{prefix + "_a", prefix + "_b", prefix + "_c"}
+	for _, id := range want {
 		err := g.UpsertTenant(ctx, types.TenantInfo{
 			ID:        id,
 			Tuple:     map[string]string{"agent": id},
@@ -248,19 +274,29 @@ func TestGraph_Tenants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("len=%d", len(got))
+	// Only count tenants matching this test's prefix; the database is
+	// shared across tests, so unrelated TenantInfo rows may exist.
+	count := 0
+	for _, t := range got {
+		for _, w := range want {
+			if t.ID == w {
+				count++
+			}
+		}
+	}
+	if count != len(want) {
+		t.Fatalf("want %d tenants, got %d in shared list (filtered to prefix)", len(want), count)
 	}
 }
 
 // TestGraph_UpdateNode_ClosureErrorAborts asserts that returning a
 // non-nil error from the UpdateNode closure rolls back the underlying
-// SQLite transaction so the previous state is preserved.
+// Bolt transaction so the previous state is preserved.
 func TestGraph_UpdateNode_ClosureErrorAborts(t *testing.T) {
-	st := openTestStorage(t, 8)
+	st, _, prefix := neo4jtest.Open(t, testDim)
 	g := st.Graph()
 	ctx := context.Background()
-	tenant := "t"
+	tenant := prefix
 
 	n := types.Node{ID: "n", TenantID: tenant, Weight: 1.0}
 	if err := g.PutNode(ctx, n); err != nil {
@@ -281,14 +317,19 @@ func TestGraph_UpdateNode_ClosureErrorAborts(t *testing.T) {
 }
 
 // TestGraph_Edge_UpdateEdge_ClosureErrorAborts confirms the same
-// rollback semantics for UpdateEdge — both edges_out and edges_in
-// must remain at their pre-closure state.
+// rollback semantics for UpdateEdge — both directions of the
+// relationship must remain at their pre-closure state.
 func TestGraph_Edge_UpdateEdge_ClosureErrorAborts(t *testing.T) {
-	st := openTestStorage(t, 8)
+	st, _, prefix := neo4jtest.Open(t, testDim)
 	g := st.Graph()
 	ctx := context.Background()
-	tenant := "t"
+	tenant := prefix
 
+	for _, id := range []string{"a", "b"} {
+		if err := g.PutNode(ctx, types.Node{ID: id, TenantID: tenant, Weight: 1}); err != nil {
+			t.Fatalf("PutNode %s: %v", id, err)
+		}
+	}
 	if err := g.PutEdge(ctx, types.MemoryEdge{
 		From: "a", To: "b", TenantID: tenant, Weight: 1.0, Kind: types.EdgeStructural,
 	}); err != nil {

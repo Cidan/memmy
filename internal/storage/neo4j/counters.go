@@ -6,9 +6,8 @@ import (
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
 
-// tenantCounters mirrors the SQLite store's per-tenant counters. The
-// counters are maintained transactionally with every Graph mutation
-// so TenantStats reads them in O(1).
+// tenantCounters tracks per-tenant aggregate counts. Maintained
+// transactionally with every Graph mutation so TenantStats is O(1).
 type tenantCounters struct {
 	NodeCount     int64
 	EdgeCount     int64
@@ -16,9 +15,9 @@ type tenantCounters struct {
 	SumEdgeWeight float64
 }
 
-// adjustCountersTx applies a delta to the per-tenant counter row
+// adjustCountersTx applies a delta to the per-tenant Counter node
 // inside an existing managed write transaction. MERGE creates the
-// row on first touch with zero baseline so the SET delta is safe.
+// node on first touch with zero baseline so the SET delta is safe.
 func adjustCountersTx(ctx context.Context, tx neo4j.ManagedTransaction, tenant string, delta tenantCounters) error {
 	_, err := tx.Run(ctx, `
 		MERGE (c:Counter {tenant: $tenant})
@@ -38,8 +37,8 @@ func adjustCountersTx(ctx context.Context, tx neo4j.ManagedTransaction, tenant s
 	return err
 }
 
-// readCountersTx reads the current counter row inside a tx. Missing
-// row returns zeros (no error).
+// readCountersTx reads the current Counter node inside a tx. Missing
+// node returns zeros (no error).
 func readCountersTx(ctx context.Context, tx neo4j.ManagedTransaction, tenant string) (tenantCounters, error) {
 	r, err := tx.Run(ctx, `
 		MATCH (c:Counter {tenant: $tenant})

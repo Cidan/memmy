@@ -2,10 +2,8 @@ package neo4jstore
 
 import "time"
 
-// Cypher returns numeric properties as int64 by default; sometimes
-// the bolt driver hands them back as int64 even when stored as int.
-// These helpers tolerate both shapes plus the empty-property zero
-// value so decoders are robust to future schema changes.
+// Bolt driver property-value decoders. Tolerate int/int64/float64
+// variants the driver may return for numeric properties.
 
 func asString(v any) string {
 	if v == nil {

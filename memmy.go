@@ -5,8 +5,12 @@
 // Typical use:
 //
 //	emb := memmy.NewFakeEmbedder(64) // or NewGeminiEmbedder(ctx, opts)
-//	svc, closer, err := memmy.Open(memmy.Options{
-//	    DBPath:   "/var/lib/myapp/memmy.db",
+//	svc, closer, err := memmy.Open(ctx, memmy.Options{
+//	    Neo4j: memmy.Neo4jOptions{
+//	        URI:      "bolt://localhost:7687",
+//	        User:     "neo4j",
+//	        Password: os.Getenv("NEO4J_PASSWORD"),
+//	    },
 //	    Embedder: emb,
 //	})
 //	if err != nil { ... }
@@ -17,10 +21,11 @@
 //	    Message: "the quick brown fox",
 //	})
 //
-// The facade mirrors cmd/memmy/main.go's wiring (storage + embedder +
-// service) without any transport layer — importers call MemoryService
-// methods directly. See DESIGN.md §0 ("Transport adapters wrap a single
-// MemoryService") for the architectural rationale.
+// The schema is bundled in the binary via embed.FS but is NOT applied
+// automatically — operators must call memmy.Migrate() (or the binary's
+// `memmy migrate` subcommand) once before Open. Open refuses to start
+// against a database whose schema version doesn't match what this
+// library was built for.
 package memmy
 
 import (
@@ -36,7 +41,7 @@ import (
 	"github.com/Cidan/memmy/internal/embed/fake"
 	"github.com/Cidan/memmy/internal/embed/gemini"
 	"github.com/Cidan/memmy/internal/service"
-	sqlitestore "github.com/Cidan/memmy/internal/storage/sqlite"
+	neo4jstore "github.com/Cidan/memmy/internal/storage/neo4j"
 	"github.com/Cidan/memmy/internal/types"
 )
 
@@ -176,20 +181,35 @@ func NewTenantSchema(cfg TenantSchemaConfig) (*TenantSchema, error) {
 	return service.NewTenantSchemaFromConfig(cfg)
 }
 
-// HNSWConfig holds the index hyperparameters for the SQLite VectorIndex
-// backend. See DESIGN.md §12.
-type HNSWConfig = sqlitestore.HNSWConfig
+// Neo4jOptions bundles the Neo4j backend credentials. The URI, User,
+// and Password are required; everything else has a sensible default.
+// The struct is shared between memmy.Open (Options.Neo4j) and
+// memmy.Migrate (MigrationOptions.Neo4j) so callers configure the
+// backend in one place regardless of which entry point they invoke.
+type Neo4jOptions struct {
+	// URI is the bolt:// (or neo4j+s://) address of the Neo4j
+	// instance. Required.
+	URI string
 
-// DefaultHNSWConfig returns the documented HNSW defaults.
-func DefaultHNSWConfig() HNSWConfig { return sqlitestore.DefaultHNSWConfig() }
+	// User / Password are the credentials for URI. Required.
+	User     string
+	Password string
 
-// Options configures Open. DBPath and Embedder are required; everything
-// else has a sensible zero-value default.
+	// Database selects the database within the Neo4j instance.
+	// Optional; "neo4j" by default.
+	Database string
+
+	// ConnectTimeout caps the initial connectivity verification.
+	// Optional; 10s by default.
+	ConnectTimeout time.Duration
+}
+
+// Options configures Open. Neo4j and Embedder are required;
+// everything else has a sensible zero-value default.
 type Options struct {
-	// DBPath is the SQLite database file path. The directory is created
-	// if absent. A leading "~/" is expanded to the current user's
-	// home directory. Required.
-	DBPath string
+	// Neo4j configures the storage backend. URI, User, and Password
+	// are required.
+	Neo4j Neo4jOptions
 
 	// Embedder produces vectors for Write inputs and Recall queries.
 	// Construct via NewFakeEmbedder or NewGeminiEmbedder, or supply
@@ -214,36 +234,46 @@ type Options struct {
 	// nil accepts any tuple shape (today's daemon default).
 	TenantSchema *TenantSchema
 
-	// HNSW configures the per-tenant HNSW index hyperparameters. nil →
-	// use DefaultHNSWConfig(). Non-nil is treated as the complete config
-	// — partial overrides must be built from DefaultHNSWConfig() the
-	// same way ServiceConfig does it.
-	HNSW *HNSWConfig
-
 	// FlatScanThreshold is the per-tenant size below which Recall uses a
-	// linear scan instead of HNSW. Optional; 0 → 5000 (DESIGN.md §6.1).
+	// linear scan instead of the native vector index. Optional; 0 → 5000
+	// (DESIGN.md §6.1).
 	FlatScanThreshold int
 
-	// BusyTimeout caps how long a blocked SQLite writer waits for the
-	// reserved lock before failing with SQLITE_BUSY. 0 → 5 seconds.
-	BusyTimeout time.Duration
-
-	// HNSWRandSeed seeds the HNSW layer-assignment RNG. 0 → time-derived
-	// (production). Tests should pass a fixed seed for determinism.
-	HNSWRandSeed uint64
+	// SkipMigrationCheck disables the schema-version guard at Open.
+	// Tests-only — production callers should never set this. The
+	// neo4jtest helper sets it because it manages migrations itself.
+	SkipMigrationCheck bool
 }
 
-// Open constructs a Service backed by SQLite (WAL mode) at opts.DBPath.
-// The returned io.Closer must be invoked at shutdown to flush WAL state
-// and close the database handles. The Embedder's lifecycle is the
-// caller's responsibility — Open does NOT close it.
+// MigrationOptions configures Migrate. Neo4j configures the backend
+// the migrations are applied to; Dim is the dimensionality the native
+// vector index is created with on first migration.
+type MigrationOptions struct {
+	Neo4j Neo4jOptions
+	Dim   int
+}
+
+// Open constructs a Service backed by Neo4j at opts.Neo4j.URI. The
+// returned io.Closer must be invoked at shutdown to release the bolt
+// driver connection pool. The Embedder's lifecycle is the caller's
+// responsibility — Open does NOT close it.
 //
 // Open does not start any transport (MCP / gRPC / HTTP); callers drive
 // the returned Service directly. To run a transport, use the cmd/memmy
 // binary with a YAML config instead.
-func Open(opts Options) (Service, io.Closer, error) {
-	if opts.DBPath == "" {
-		return nil, nil, errors.New("memmy: Options.DBPath is required")
+//
+// Open refuses to start against a database whose schema version does
+// not match what this build of memmy expects. The fix is to run
+// memmy.Migrate (or the binary's `memmy migrate` subcommand) once.
+func Open(ctx context.Context, opts Options) (Service, io.Closer, error) {
+	if opts.Neo4j.URI == "" {
+		return nil, nil, errors.New("memmy: Options.Neo4j.URI is required")
+	}
+	if opts.Neo4j.User == "" {
+		return nil, nil, errors.New("memmy: Options.Neo4j.User is required")
+	}
+	if opts.Neo4j.Password == "" {
+		return nil, nil, errors.New("memmy: Options.Neo4j.Password is required")
 	}
 	if opts.Embedder == nil {
 		return nil, nil, errors.New("memmy: Options.Embedder is required")
@@ -253,26 +283,40 @@ func Open(opts Options) (Service, io.Closer, error) {
 		return nil, nil, fmt.Errorf("memmy: embedder reported invalid dim %d", dim)
 	}
 
-	hnsw := DefaultHNSWConfig()
-	if opts.HNSW != nil {
-		hnsw = *opts.HNSW
-	}
 	svcCfg := DefaultServiceConfig()
 	if opts.ServiceConfig != nil {
 		svcCfg = *opts.ServiceConfig
 	}
 
-	storage, err := sqlitestore.Open(sqlitestore.Options{
-		Path:              opts.DBPath,
+	storage, err := neo4jstore.Open(ctx, neo4jstore.Options{
+		URI:               opts.Neo4j.URI,
+		Username:          opts.Neo4j.User,
+		Password:          opts.Neo4j.Password,
+		Database:          opts.Neo4j.Database,
 		Dim:               dim,
-		HNSW:              hnsw,
 		FlatScanThreshold: opts.FlatScanThreshold,
 		Clock:             opts.Clock,
-		RandSeed:          opts.HNSWRandSeed,
-		BusyTimeout:       opts.BusyTimeout,
+		ConnectTimeout:    opts.Neo4j.ConnectTimeout,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("memmy: open storage: %w", err)
+	}
+
+	if !opts.SkipMigrationCheck {
+		want, err := neo4jstore.RequiredSchemaVersion()
+		if err != nil {
+			_ = storage.Close()
+			return nil, nil, fmt.Errorf("memmy: read required schema version: %w", err)
+		}
+		got, err := storage.CurrentSchemaVersion(ctx)
+		if err != nil {
+			_ = storage.Close()
+			return nil, nil, fmt.Errorf("memmy: read current schema version: %w", err)
+		}
+		if got != want {
+			_ = storage.Close()
+			return nil, nil, fmt.Errorf("memmy: schema version mismatch (database is at v%d, this build requires v%d). Call memmy.Migrate() or run `memmy migrate` first", got, want)
+		}
 	}
 
 	svc, err := service.New(
@@ -288,4 +332,41 @@ func Open(opts Options) (Service, io.Closer, error) {
 		return nil, nil, fmt.Errorf("memmy: build service: %w", err)
 	}
 	return svc, storage, nil
+}
+
+// Migrate applies every embedded migration whose version is greater
+// than the database's current applied version. Idempotent: re-running
+// against an up-to-date database is a no-op.
+//
+// opts.Dim sets the dimensionality the native vector index is created
+// with on first migration; subsequent calls with a different dim are
+// silently fine because the index is only created once. Callers that
+// later switch embedder dims must drop the existing index manually
+// (see DESIGN.md §13.1) and re-Migrate to re-create it.
+func Migrate(ctx context.Context, opts MigrationOptions) error {
+	if opts.Neo4j.URI == "" {
+		return errors.New("memmy: MigrationOptions.Neo4j.URI required")
+	}
+	if opts.Neo4j.User == "" {
+		return errors.New("memmy: MigrationOptions.Neo4j.User required")
+	}
+	if opts.Neo4j.Password == "" {
+		return errors.New("memmy: MigrationOptions.Neo4j.Password required")
+	}
+	if opts.Dim < 1 {
+		return errors.New("memmy: MigrationOptions.Dim must be >= 1")
+	}
+	storage, err := neo4jstore.Open(ctx, neo4jstore.Options{
+		URI:            opts.Neo4j.URI,
+		Username:       opts.Neo4j.User,
+		Password:       opts.Neo4j.Password,
+		Database:       opts.Neo4j.Database,
+		Dim:            opts.Dim,
+		ConnectTimeout: opts.Neo4j.ConnectTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("memmy: open for migrate: %w", err)
+	}
+	defer storage.Close()
+	return storage.Migrate(ctx)
 }

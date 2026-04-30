@@ -13,9 +13,11 @@ import (
 	"github.com/Cidan/memmy/internal/embed/fake"
 	"github.com/Cidan/memmy/internal/eval/corpus"
 	"github.com/Cidan/memmy/internal/eval/harness"
+	"github.com/Cidan/memmy/internal/eval/inspect"
 	"github.com/Cidan/memmy/internal/eval/metrics"
 	"github.com/Cidan/memmy/internal/eval/queries"
 	"github.com/Cidan/memmy/internal/eval/sweep"
+	"github.com/Cidan/memmy/internal/storage/neo4j/neo4jtest"
 )
 
 // Synthetic JSONL with three turns spread over an hour so the
@@ -136,15 +138,18 @@ func TestSweep_TwoEntriesEndToEnd(t *testing.T) {
 		if err := os.MkdirAll(runDir, 0o700); err != nil {
 			t.Fatalf("mkdir run: %v", err)
 		}
+		_, ntConn, prefix := neo4jtest.Open(t, 32)
+		conn := inspect.Connection{URI: ntConn.URI, User: ntConn.User, Password: ntConn.Password, Database: ntConn.Database}
+		tenant := map[string]string{"agent": prefix, "entry": entry.Name}
 		replay, err := harness.Replay(ctx, harness.ReplayOptions{
 			CorpusStorePath: corpusPath,
 			EmbedCachePath:  cachePath,
-			MemmyDBPath:     filepath.Join(runDir, "memmy.db"),
 			Embedder:        embedder,
 			EmbedderModelID: modelID,
 			ServiceConfig:   &cfgCopy,
-			HNSWRandSeed:    42,
 			DatasetName:     "alpha",
+			Neo4j:           conn,
+			TenantTuple:     tenant,
 		})
 		if err != nil {
 			t.Fatalf("Replay %s: %v", entry.Name, err)
@@ -152,7 +157,7 @@ func TestSweep_TwoEntriesEndToEnd(t *testing.T) {
 		runResults, err := harness.RunQueries(ctx, allQs, harness.RunQueriesOptions{
 			Service:      replay.Service,
 			Tenant:       replay.Tenant,
-			InspectPath:  filepath.Join(runDir, "memmy.db"),
+			InspectConn:  conn,
 			K:            3,
 			Hops:         1,
 			FakeClock:    replay.FakeClock,

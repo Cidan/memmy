@@ -12,9 +12,23 @@ import (
 	"github.com/Cidan/memmy/internal/embed/fake"
 	"github.com/Cidan/memmy/internal/eval/corpus"
 	"github.com/Cidan/memmy/internal/eval/harness"
+	"github.com/Cidan/memmy/internal/eval/inspect"
 	"github.com/Cidan/memmy/internal/eval/metrics"
 	"github.com/Cidan/memmy/internal/eval/queries"
+	"github.com/Cidan/memmy/internal/storage/neo4j/neo4jtest"
 )
+
+// neo4jConnAndPrefix opens the neo4jtest Storage to acquire the dev
+// Neo4j credentials and a per-test tenant prefix that the cleanup hook
+// will DETACH DELETE. The Storage handle itself is not used; the
+// harness opens its own through memmy.Open().
+func neo4jConnAndPrefix(t *testing.T) (inspect.Connection, string) {
+	t.Helper()
+	_, conn, prefix := neo4jtest.Open(t, 32)
+	return inspect.Connection{
+		URI: conn.URI, User: conn.User, Password: conn.Password, Database: conn.Database,
+	}, prefix
+}
 
 // Synthetic JSONL with three user turns, each on a distinct topic.
 // Spans 30 minutes of simulated time so decay/reinforcement math has
@@ -75,14 +89,15 @@ func TestEndToEnd_IngestReplayRunMetrics(t *testing.T) {
 	}
 
 	// 2) Replay into a fresh memmy db.
+	conn, prefix := neo4jConnAndPrefix(t)
 	replayRes, err := harness.Replay(ctx, harness.ReplayOptions{
 		CorpusStorePath: filepath.Join(root, "corpus.sqlite"),
 		EmbedCachePath:  filepath.Join(root, "embedcache.sqlite"),
-		MemmyDBPath:     filepath.Join(root, "memmy.db"),
 		Embedder:        embedder,
 		EmbedderModelID: modelID,
-		HNSWRandSeed:    42,
 		DatasetName:     "alpha",
+		Neo4j:           conn,
+		TenantTuple:     map[string]string{"agent": prefix},
 	})
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
@@ -123,12 +138,12 @@ func TestEndToEnd_IngestReplayRunMetrics(t *testing.T) {
 
 	// 4) RunQueries.
 	results, err := harness.RunQueries(ctx, qs, harness.RunQueriesOptions{
-		Service:     replayRes.Service,
-		Tenant:      replayRes.Tenant,
-		InspectPath: filepath.Join(root, "memmy.db"),
-		K:           5,
-		Hops:        1,
-		FakeClock:   replayRes.FakeClock,
+		Service:      replayRes.Service,
+		Tenant:       replayRes.Tenant,
+		InspectConn:  conn,
+		K:            5,
+		Hops:         1,
+		FakeClock:    replayRes.FakeClock,
 		AdvanceClock: 2 * time.Minute, // step past the 60s default refractory window between queries
 	})
 	if err != nil {
@@ -219,13 +234,14 @@ func TestReplay_AdvancesClockToTurnTimestamps(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
+	conn, prefix := neo4jConnAndPrefix(t)
 	res, err := harness.Replay(ctx, harness.ReplayOptions{
 		CorpusStorePath: filepath.Join(root, "corpus.sqlite"),
 		EmbedCachePath:  filepath.Join(root, "embedcache.sqlite"),
-		MemmyDBPath:     filepath.Join(root, "memmy.db"),
 		Embedder:        embedder,
 		EmbedderModelID: modelID,
-		HNSWRandSeed:    42,
+		Neo4j:           conn,
+		TenantTuple:     map[string]string{"agent": prefix},
 	})
 	if err != nil {
 		t.Fatalf("Replay: %v", err)

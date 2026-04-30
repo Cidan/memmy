@@ -2,41 +2,48 @@ package inspect_test
 
 import (
 	"context"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Cidan/memmy"
 	"github.com/Cidan/memmy/internal/eval/inspect"
+	"github.com/Cidan/memmy/internal/storage/neo4j/neo4jtest"
 )
 
-// inspect opens the memmy SQLite db with mode=ro through a SECOND
-// connection pool. The whole architectural reason this is allowed is
-// SQLite's WAL mode: many readers + one writer concurrently. This test
-// exercises that contract end-to-end — write through the live service
-// while inspect is open, then confirm inspect sees the new state.
+// inspect opens its own driver against the same Neo4j the live memmy
+// service writes to. Bolt allows many concurrent readers and writers
+// against one database; this test exercises that contract end-to-end —
+// write through the live service while inspect is open, then confirm
+// inspect sees the new state.
 func TestInspect_SeesWritesFromConcurrentService(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "memmy.db")
-	svc, closer, err := memmy.Open(memmy.Options{
-		DBPath:       dbPath,
-		Embedder:     memmy.NewFakeEmbedder(32),
-		Clock:        memmy.NewFakeClock(time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)),
-		HNSWRandSeed: 42,
+	_, conn, prefix := neo4jtest.Open(t, 32)
+	svc, closer, err := memmy.Open(context.Background(), memmy.Options{
+		Neo4j: memmy.Neo4jOptions{
+			URI:      conn.URI,
+			User:     conn.User,
+			Password: conn.Password,
+			Database: conn.Database,
+		},
+		Embedder:           memmy.NewFakeEmbedder(32),
+		Clock:              memmy.NewFakeClock(time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)),
+		SkipMigrationCheck: true,
 	})
 	if err != nil {
 		t.Fatalf("memmy.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = closer.Close() })
 
-	r, err := inspect.Open(dbPath)
+	r, err := inspect.Open(inspect.Connection{
+		URI: conn.URI, User: conn.User, Password: conn.Password, Database: conn.Database,
+	})
 	if err != nil {
 		t.Fatalf("inspect.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = r.Close() })
 
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": prefix}
 
 	var (
 		writeWG sync.WaitGroup
@@ -70,10 +77,16 @@ func TestInspect_SeesWritesFromConcurrentService(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTenants: %v", err)
 	}
-	if len(tenants) != 1 {
-		t.Fatalf("got %d tenants, want 1", len(tenants))
+	var tenantID string
+	for _, te := range tenants {
+		if te.Tuple["agent"] == prefix {
+			tenantID = te.ID
+			break
+		}
 	}
-	tenantID := tenants[0].ID
+	if tenantID == "" {
+		t.Fatalf("did not find our tenant in %d listed", len(tenants))
+	}
 
 	states, err := r.NodeStates(ctx, tenantID, nodeIDs)
 	if err != nil {
@@ -88,11 +101,16 @@ func TestInspect_SeesWritesFromConcurrentService(t *testing.T) {
 // erroring — important contract for the harness which can pass a hit
 // list that includes nodes that aged out of the db.
 func TestInspect_NodeStatesSilentlyOmitsUnknownIDs(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "memmy.db")
-	svc, closer, err := memmy.Open(memmy.Options{
-		DBPath:       dbPath,
-		Embedder:     memmy.NewFakeEmbedder(32),
-		HNSWRandSeed: 99,
+	_, conn, prefix := neo4jtest.Open(t, 32)
+	svc, closer, err := memmy.Open(context.Background(), memmy.Options{
+		Neo4j: memmy.Neo4jOptions{
+			URI:      conn.URI,
+			User:     conn.User,
+			Password: conn.Password,
+			Database: conn.Database,
+		},
+		Embedder:           memmy.NewFakeEmbedder(32),
+		SkipMigrationCheck: true,
 	})
 	if err != nil {
 		t.Fatalf("memmy.Open: %v", err)
@@ -100,19 +118,27 @@ func TestInspect_NodeStatesSilentlyOmitsUnknownIDs(t *testing.T) {
 	t.Cleanup(func() { _ = closer.Close() })
 
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": prefix}
 	w, err := svc.Write(ctx, memmy.WriteRequest{Tenant: tenant, Message: "S1. S2. S3. S4. S5."})
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
-	r, err := inspect.Open(dbPath)
+	r, err := inspect.Open(inspect.Connection{
+		URI: conn.URI, User: conn.User, Password: conn.Password, Database: conn.Database,
+	})
 	if err != nil {
 		t.Fatalf("inspect.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = r.Close() })
 	tenants, _ := r.ListTenants(ctx)
-	tenantID := tenants[0].ID
+	var tenantID string
+	for _, te := range tenants {
+		if te.Tuple["agent"] == prefix {
+			tenantID = te.ID
+			break
+		}
+	}
 
 	mixed := append([]string{"no-such", "also-missing"}, w.NodeIDs[0])
 	states, err := r.NodeStates(ctx, tenantID, mixed)
@@ -128,25 +154,10 @@ func TestInspect_NodeStatesSilentlyOmitsUnknownIDs(t *testing.T) {
 }
 
 func TestInspect_ListNodes_EmptyTenantReturnsEmpty(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "memmy.db")
-	svc, closer, err := memmy.Open(memmy.Options{
-		DBPath:       dbPath,
-		Embedder:     memmy.NewFakeEmbedder(32),
-		HNSWRandSeed: 11,
+	_, conn, _ := neo4jtest.Open(t, 32)
+	r, err := inspect.Open(inspect.Connection{
+		URI: conn.URI, User: conn.User, Password: conn.Password, Database: conn.Database,
 	})
-	if err != nil {
-		t.Fatalf("memmy.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = closer.Close() })
-
-	// Materialize a tenant so the db has the tenant row but zero nodes.
-	if _, err := svc.Stats(context.Background(), memmy.StatsRequest{
-		Tenant: map[string]string{"agent": "noone"},
-	}); err != nil {
-		t.Fatalf("Stats: %v", err)
-	}
-
-	r, err := inspect.Open(dbPath)
 	if err != nil {
 		t.Fatalf("inspect.Open: %v", err)
 	}

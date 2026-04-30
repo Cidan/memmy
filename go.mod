@@ -6,6 +6,7 @@ require (
 	github.com/google/jsonschema-go v0.4.2
 	github.com/mattn/go-sqlite3 v1.14.42
 	github.com/modelcontextprotocol/go-sdk v1.5.0
+	github.com/neo4j/neo4j-go-driver/v5 v5.28.4
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/schollz/progressbar/v3 v3.19.0
 	github.com/spf13/cobra v1.10.2
@@ -25,7 +26,6 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mitchellh/colorstring v0.0.0-20190213212951-d06e56a500db // indirect
-	github.com/neo4j/neo4j-go-driver/v5 v5.28.4 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/segmentio/asm v1.1.3 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect

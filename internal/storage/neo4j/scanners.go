@@ -118,8 +118,7 @@ func (g graphAdapter) MessageIDsBefore(ctx context.Context, tenant string, befor
 	return res.([]string), nil
 }
 
-// TenantStats reads the per-tenant counter row in O(1). Mirrors the
-// SQLite store's contract; backs service.Stats.
+// TenantStats reads the per-tenant Counter node in O(1).
 func (g graphAdapter) TenantStats(ctx context.Context, tenant string) (service.TenantStats, error) {
 	var ts service.TenantStats
 	_, err := g.s.withReadSession(ctx, func(tx neo4j.ManagedTransaction) (any, error) {

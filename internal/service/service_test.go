@@ -2,39 +2,32 @@ package service_test
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/Cidan/memmy/internal/clock"
 	"github.com/Cidan/memmy/internal/embed/fake"
 	"github.com/Cidan/memmy/internal/service"
-	sqlitestore "github.com/Cidan/memmy/internal/storage/sqlite"
+	neo4jstore "github.com/Cidan/memmy/internal/storage/neo4j"
+	"github.com/Cidan/memmy/internal/storage/neo4j/neo4jtest"
 	"github.com/Cidan/memmy/internal/types"
 )
 
-// fixture builds a real SQLite-backed Service with a Fake clock and
-// Fake embedder. All state lives in t.TempDir().
+// fixture builds a real Neo4j-backed Service with a Fake clock and
+// Fake embedder. The dev Neo4j is reused across tests; isolation is
+// per-tenant via the prefix returned by neo4jtest.Open.
 type fixture struct {
-	svc   *service.Service
-	store *sqlitestore.Storage
-	cl    *clock.Fake
-	emb   *fake.Embedder
-	cfg   service.Config
+	svc    *service.Service
+	store  *neo4jstore.Storage
+	cl     *clock.Fake
+	emb    *fake.Embedder
+	cfg    service.Config
+	prefix string
 }
 
 func newFixture(t *testing.T, dim int, opts ...func(*service.Config)) *fixture {
 	t.Helper()
-	store, err := sqlitestore.Open(sqlitestore.Options{
-		Path:              filepath.Join(t.TempDir(), "memmy.db"),
-		Dim:               dim,
-		RandSeed:          42,
-		FlatScanThreshold: 100000, // force flat scan in service tests for stability
-	})
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
+	store, _, prefix := neo4jtest.Open(t, dim, neo4jtest.WithFlatScanThreshold(100000))
 
 	cl := clock.NewFake(time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC))
 	emb := fake.New(dim)
@@ -47,13 +40,13 @@ func newFixture(t *testing.T, dim int, opts ...func(*service.Config)) *fixture {
 	if err != nil {
 		t.Fatalf("service.New: %v", err)
 	}
-	return &fixture{svc: svc, store: store, cl: cl, emb: emb, cfg: cfg}
+	return &fixture{svc: svc, store: store, cl: cl, emb: emb, cfg: cfg, prefix: prefix}
 }
 
 func TestService_Write_CreatesNodesVectorsEdges(t *testing.T) {
 	f := newFixture(t, 32)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 
 	res, err := f.svc.Write(ctx, types.WriteRequest{
 		Tenant:  tenant,
@@ -111,7 +104,7 @@ func TestService_Write_CreatesNodesVectorsEdges(t *testing.T) {
 func TestService_Recall_ReturnsExactMatch(t *testing.T) {
 	f := newFixture(t, 32)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 
 	if _, err := f.svc.Write(ctx, types.WriteRequest{
 		Tenant:  tenant,
@@ -148,7 +141,7 @@ func TestService_Recall_HotMemoryRanksAboveStale(t *testing.T) {
 		c.SimAlpha = 0.5   // dampen sim effect
 	})
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 
 	// Two candidate memories with the SAME text → identical embeddings,
 	// so raw similarity to a query is identical. We then bump the access
@@ -226,7 +219,7 @@ func TestService_Recall_HotMemoryRanksAboveStale(t *testing.T) {
 func TestService_Recall_FormsCoRetrievalEdges(t *testing.T) {
 	f := newFixture(t, 32)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 
 	resA, err := f.svc.Write(ctx, types.WriteRequest{
 		Tenant: tenant, Message: "alpha beta gamma. delta epsilon.",
@@ -282,7 +275,7 @@ func TestService_Recall_FormsCoRetrievalEdges(t *testing.T) {
 func TestService_Recall_ExpandsViaMemoryEdges(t *testing.T) {
 	f := newFixture(t, 32)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 	tenantID := types.TenantID(tenant)
 
 	resA, err := f.svc.Write(ctx, types.WriteRequest{
@@ -341,7 +334,7 @@ func TestService_Recall_PrunesEdgeBelowFloor(t *testing.T) {
 		c.EdgeCoRetrievalLambda = 1e-3 // strong decay so a long Δt drops it fast
 	})
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 	tenantID := types.TenantID(tenant)
 
 	res, err := f.svc.Write(ctx, types.WriteRequest{
@@ -386,7 +379,7 @@ func TestService_Recall_PrunesEdgeBelowFloor(t *testing.T) {
 func TestService_Forget_ByMessageID(t *testing.T) {
 	f := newFixture(t, 32)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 	tenantID := types.TenantID(tenant)
 
 	resA, err := f.svc.Write(ctx, types.WriteRequest{
@@ -433,7 +426,7 @@ func TestService_Forget_ByMessageID(t *testing.T) {
 func TestService_Forget_BeforeTimestamp(t *testing.T) {
 	f := newFixture(t, 32)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 	tenantID := types.TenantID(tenant)
 
 	old, err := f.svc.Write(ctx, types.WriteRequest{
@@ -473,7 +466,7 @@ func TestService_Forget_BeforeTimestamp(t *testing.T) {
 func TestService_Stats(t *testing.T) {
 	f := newFixture(t, 32)
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": f.prefix}
 
 	if _, err := f.svc.Write(ctx, types.WriteRequest{Tenant: tenant, Message: "S1. S2. S3."}); err != nil {
 		t.Fatal(err)

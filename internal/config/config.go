@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -63,15 +64,16 @@ type TransportConfig struct {
 }
 
 type StorageConfig struct {
-	Backend string              `yaml:"backend"`
-	SQLite  SQLiteStorageConfig `yaml:"sqlite"`
+	Backend string             `yaml:"backend"`
+	Neo4j   Neo4jStorageConfig `yaml:"neo4j"`
 }
 
-type SQLiteStorageConfig struct {
-	Path string `yaml:"path"`
-	// BusyTimeout caps how long a blocked SQLite writer waits for the
-	// reserved lock before failing with SQLITE_BUSY. 0 → 5 seconds default.
-	BusyTimeout time.Duration `yaml:"busy_timeout"`
+type Neo4jStorageConfig struct {
+	URI            string        `yaml:"uri"`
+	User           string        `yaml:"user"`
+	Password       string        `yaml:"password"` // ${ENV_VAR} expansion supported
+	Database       string        `yaml:"database"`
+	ConnectTimeout time.Duration `yaml:"connect_timeout"`
 }
 
 type EmbedderConfig struct {
@@ -92,16 +94,11 @@ type FakeEmbedderConfig struct {
 }
 
 type VectorIndexConfig struct {
-	FlatScanThreshold int        `yaml:"flat_scan_threshold"`
-	HNSW              HNSWParams `yaml:"hnsw"`
-}
-
-type HNSWParams struct {
-	M              int     `yaml:"m"`
-	M0             int     `yaml:"m0"`
-	EfConstruction int     `yaml:"ef_construction"`
-	EfSearch       int     `yaml:"ef_search"`
-	ML             float64 `yaml:"ml"`
+	// FlatScanThreshold is the per-tenant size below which Recall uses
+	// a Cypher flat scan instead of the native vector index. Neo4j's
+	// vector index has no exposed HNSW knobs; tuning it requires DDL
+	// on the index itself (see DESIGN.md §13.1).
+	FlatScanThreshold int `yaml:"flat_scan_threshold"`
 }
 
 type MemoryConfig struct {
@@ -172,8 +169,14 @@ func Default() Config {
 			Transports: map[string]TransportConfig{},
 		},
 		Storage: StorageConfig{
-			Backend: "sqlite",
-			SQLite:  SQLiteStorageConfig{Path: "./data/memmy.db"},
+			Backend: "neo4j",
+			Neo4j: Neo4jStorageConfig{
+				URI:            "bolt://localhost:7687",
+				User:           "neo4j",
+				Password:       "",
+				Database:       "neo4j",
+				ConnectTimeout: 10 * time.Second,
+			},
 		},
 		Embedder: EmbedderConfig{
 			Backend: "fake",
@@ -196,13 +199,6 @@ func Default() Config {
 		},
 		VectorIndex: VectorIndexConfig{
 			FlatScanThreshold: 5000,
-			HNSW: HNSWParams{
-				M:              16,
-				M0:             32,
-				EfConstruction: 200,
-				EfSearch:       100,
-				ML:             0.36,
-			},
 		},
 		Memory: MemoryConfig{
 			ChunkWindowSize:       3,
@@ -236,7 +232,9 @@ func Default() Config {
 }
 
 // Load reads and parses a YAML file at path, applying any unspecified
-// fields from Default(). Returns a validated Config.
+// fields from Default(). Returns a validated Config. Secrets that
+// reference environment variables (`${VAR_NAME}`) are expanded in
+// place before validation.
 func Load(path string) (Config, error) {
 	cfg := Default()
 	raw, err := os.ReadFile(path)
@@ -246,20 +244,54 @@ func Load(path string) (Config, error) {
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return Config{}, fmt.Errorf("config: unmarshal %q: %w", path, err)
 	}
+	cfg.Storage.Neo4j.Password = expandEnv(cfg.Storage.Neo4j.Password)
+	cfg.Embedder.Gemini.APIKey = expandEnv(cfg.Embedder.Gemini.APIKey)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
+// expandEnv expands a single `${VAR}` token at any position. Unset
+// vars expand to "". Strings without `${` are returned unchanged.
+func expandEnv(s string) string {
+	if !strings.Contains(s, "${") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if i+1 < len(s) && s[i] == '$' && s[i+1] == '{' {
+			end := strings.IndexByte(s[i+2:], '}')
+			if end < 0 {
+				b.WriteByte(s[i])
+				i++
+				continue
+			}
+			name := s[i+2 : i+2+end]
+			b.WriteString(os.Getenv(name))
+			i += 2 + end + 1
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
 // Validate reports an error if any required field is missing or any
 // numeric tunable is outside a sane range.
 func (c Config) Validate() error {
-	if c.Storage.Backend != "sqlite" {
-		return fmt.Errorf("config: unsupported storage backend %q (only sqlite for v1)", c.Storage.Backend)
+	if c.Storage.Backend != "neo4j" {
+		return fmt.Errorf("config: unsupported storage backend %q (only neo4j is supported)", c.Storage.Backend)
 	}
-	if c.Storage.SQLite.Path == "" {
-		return errors.New("config: storage.sqlite.path required")
+	if c.Storage.Neo4j.URI == "" {
+		return errors.New("config: storage.neo4j.uri required")
+	}
+	if c.Storage.Neo4j.User == "" {
+		return errors.New("config: storage.neo4j.user required")
+	}
+	if c.Storage.Neo4j.Password == "" {
+		return errors.New("config: storage.neo4j.password required (supports ${ENV_VAR})")
 	}
 	switch c.Embedder.Backend {
 	case "gemini":
@@ -278,9 +310,6 @@ func (c Config) Validate() error {
 	}
 	if c.VectorIndex.FlatScanThreshold < 0 {
 		return errors.New("config: vector_index.flat_scan_threshold must be >= 0")
-	}
-	if c.VectorIndex.HNSW.M <= 0 || c.VectorIndex.HNSW.M0 <= 0 || c.VectorIndex.HNSW.EfConstruction <= 0 {
-		return errors.New("config: vector_index.hnsw parameters must be > 0")
 	}
 	if c.Memory.ChunkWindowSize < 1 || c.Memory.ChunkStride < 1 {
 		return errors.New("config: chunk window/stride must be >= 1")

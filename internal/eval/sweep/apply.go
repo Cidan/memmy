@@ -36,28 +36,3 @@ func ApplyServiceOverrides(base memmy.ServiceConfig, overrides map[string]any) (
 	}
 	return out, nil
 }
-
-// ApplyHNSWOverrides is the HNSW-config equivalent of ApplyServiceOverrides.
-func ApplyHNSWOverrides(base memmy.HNSWConfig, overrides map[string]any) (memmy.HNSWConfig, error) {
-	if len(overrides) == 0 {
-		return base, nil
-	}
-	raw, err := json.Marshal(base)
-	if err != nil {
-		return memmy.HNSWConfig{}, fmt.Errorf("sweep: marshal hnsw: %w", err)
-	}
-	var asMap map[string]any
-	if err := json.Unmarshal(raw, &asMap); err != nil {
-		return memmy.HNSWConfig{}, fmt.Errorf("sweep: unmarshal hnsw: %w", err)
-	}
-	maps.Copy(asMap, overrides)
-	merged, err := json.Marshal(asMap)
-	if err != nil {
-		return memmy.HNSWConfig{}, fmt.Errorf("sweep: marshal merged hnsw: %w", err)
-	}
-	out := base
-	if err := json.Unmarshal(merged, &out); err != nil {
-		return memmy.HNSWConfig{}, fmt.Errorf("sweep: unmarshal merged hnsw: %w", err)
-	}
-	return out, nil
-}

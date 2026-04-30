@@ -1,13 +1,16 @@
-// Command memmy runs the memmy LLM-memory MCP server.
+// Command memmy runs the memmy LLM-memory MCP server, plus the
+// `migrate` subcommand that applies the bundled Neo4j schema.
 //
-// Wires the configured embedder, storage backend, MemoryService, and
-// transport adapters under a suture supervisor (DESIGN.md §11).
+// `memmy serve` (default if no subcommand) wires the configured
+// embedder, Neo4j storage, MemoryService, and transport adapters
+// under a suture supervisor (DESIGN.md §11). It refuses to start
+// against a Neo4j whose schema version doesn't match this build —
+// run `memmy migrate` first.
 package main
 
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,48 +20,104 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/thejerf/suture/v4"
 
+	"github.com/Cidan/memmy"
 	"github.com/Cidan/memmy/internal/clock"
 	"github.com/Cidan/memmy/internal/config"
 	"github.com/Cidan/memmy/internal/embed"
 	"github.com/Cidan/memmy/internal/embed/fake"
 	"github.com/Cidan/memmy/internal/embed/gemini"
 	"github.com/Cidan/memmy/internal/service"
-	sqlitestore "github.com/Cidan/memmy/internal/storage/sqlite"
+	neo4jstore "github.com/Cidan/memmy/internal/storage/neo4j"
 	mcpadapter "github.com/Cidan/memmy/internal/transport/mcp"
 )
 
 func main() {
-	if err := run(); err != nil {
+	root := newRootCmd()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if err := root.ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "memmy:", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	configPath := flag.String("config", "memmy.yaml", "path to YAML configuration file")
-	flag.Parse()
+func newRootCmd() *cobra.Command {
+	var configPath string
+	root := &cobra.Command{
+		Use:   "memmy",
+		Short: "memmy — LLM-memory MCP server backed by Neo4j",
+		// Default action when invoked with no subcommand is `serve`.
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runServe(cmd.Context(), configPath)
+		},
+		SilenceUsage: true,
+	}
+	root.PersistentFlags().StringVar(&configPath, "config", "memmy.yaml", "path to YAML configuration file")
 
-	// Logs always go to stderr — in stdio mode stdout is reserved for
-	// the MCP JSON-RPC frame stream.
+	root.AddCommand(newServeCmd(&configPath))
+	root.AddCommand(newMigrateCmd(&configPath))
+	return root
+}
+
+func newServeCmd(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "serve",
+		Short: "Run the memmy MCP server (default action)",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runServe(cmd.Context(), *configPath)
+		},
+	}
+}
+
+func newMigrateCmd(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "migrate",
+		Short: "Apply pending Neo4j schema migrations and exit",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := config.Load(*configPath)
+			if err != nil {
+				return err
+			}
+			if err := memmy.Migrate(cmd.Context(), memmy.MigrationOptions{
+				Neo4j: memmy.Neo4jOptions{
+					URI:            cfg.Storage.Neo4j.URI,
+					User:           cfg.Storage.Neo4j.User,
+					Password:       cfg.Storage.Neo4j.Password,
+					Database:       cfg.Storage.Neo4j.Database,
+					ConnectTimeout: cfg.Storage.Neo4j.ConnectTimeout,
+				},
+				Dim: cfg.EmbedderDim(),
+			}); err != nil {
+				return fmt.Errorf("migrate: %w", err)
+			}
+			fmt.Fprintln(os.Stderr, "memmy: schema up-to-date")
+			return nil
+		},
+	}
+}
+
+func runServe(ctx context.Context, configPath string) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(logger)
 
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
 	}
-	logger.Info("config loaded", "path", *configPath, "storage_backend", cfg.Storage.Backend, "embedder_backend", cfg.Embedder.Backend)
+	logger.Info("config loaded", "path", configPath, "storage_backend", cfg.Storage.Backend, "embedder_backend", cfg.Embedder.Backend)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	storage, err := openStorage(cfg)
+	storage, err := openStorage(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("open storage: %w", err)
 	}
 	defer storage.Close()
+
+	if err := guardSchema(ctx, storage); err != nil {
+		return err
+	}
 
 	embedder, err := buildEmbedder(ctx, cfg)
 	if err != nil {
@@ -135,27 +194,37 @@ func run() error {
 
 // ----- storage -----
 
-func openStorage(cfg config.Config) (*sqlitestore.Storage, error) {
-	switch cfg.Storage.Backend {
-	case "sqlite":
-		return sqlitestore.Open(sqlitestore.Options{
-			Path: cfg.Storage.SQLite.Path,
-			Dim:  cfg.EmbedderDim(),
-			HNSW: sqlitestore.HNSWConfig{
-				M:              cfg.VectorIndex.HNSW.M,
-				M0:             cfg.VectorIndex.HNSW.M0,
-				EfConstruction: cfg.VectorIndex.HNSW.EfConstruction,
-				EfSearch:       cfg.VectorIndex.HNSW.EfSearch,
-				ML:             cfg.VectorIndex.HNSW.ML,
-			},
-			FlatScanThreshold: cfg.VectorIndex.FlatScanThreshold,
-			BusyTimeout:       cfg.Storage.SQLite.BusyTimeout,
-		})
-	case "bbolt":
-		return nil, fmt.Errorf("storage backend %q has been removed; switch storage.backend to %q (memories must be re-written — there is no migration path)", "bbolt", "sqlite")
-	default:
-		return nil, fmt.Errorf("unsupported storage backend %q", cfg.Storage.Backend)
+func openStorage(ctx context.Context, cfg config.Config) (*neo4jstore.Storage, error) {
+	if cfg.Storage.Backend != "neo4j" {
+		return nil, fmt.Errorf("unsupported storage backend %q (only neo4j is supported)", cfg.Storage.Backend)
 	}
+	return neo4jstore.Open(ctx, neo4jstore.Options{
+		URI:               cfg.Storage.Neo4j.URI,
+		Username:          cfg.Storage.Neo4j.User,
+		Password:          cfg.Storage.Neo4j.Password,
+		Database:          cfg.Storage.Neo4j.Database,
+		ConnectTimeout:    cfg.Storage.Neo4j.ConnectTimeout,
+		Dim:               cfg.EmbedderDim(),
+		FlatScanThreshold: cfg.VectorIndex.FlatScanThreshold,
+	})
+}
+
+// guardSchema rejects start-up against a database whose schema version
+// is older than what this build of memmy expects. The remediation is
+// `memmy migrate --config <path>`.
+func guardSchema(ctx context.Context, storage *neo4jstore.Storage) error {
+	want, err := neo4jstore.RequiredSchemaVersion()
+	if err != nil {
+		return fmt.Errorf("read required schema version: %w", err)
+	}
+	got, err := storage.CurrentSchemaVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("read current schema version: %w", err)
+	}
+	if got != want {
+		return fmt.Errorf("memmy: database schema v%d required, current v%d. Run `memmy migrate --config <path>` first", want, got)
+	}
+	return nil
 }
 
 // ----- embedder -----

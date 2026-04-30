@@ -24,7 +24,6 @@ func newSweepCmd() *cobra.Command {
 		k            int
 		hops         int
 		oversample   int
-		seed         uint64
 	)
 	cmd := &cobra.Command{
 		Use:   "sweep",
@@ -45,7 +44,11 @@ func newSweepCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			baseCfg, baseHNSW, err := loadServiceConfig(firstNonEmpty(baseConfig, matrix.Base))
+			baseCfg, err := loadServiceConfig(firstNonEmpty(baseConfig, matrix.Base))
+			if err != nil {
+				return err
+			}
+			conn, err := neo4jConnFromEnv()
 			if err != nil {
 				return err
 			}
@@ -66,13 +69,9 @@ func newSweepCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("entry %s: %w", entry.Name, err)
 				}
-				hnsw, err := sweep.ApplyHNSWOverrides(baseHNSW, entry.HNSW)
-				if err != nil {
-					return fmt.Errorf("entry %s: %w", entry.Name, err)
-				}
 				runID := sweepID + "/" + sanitize(entry.Name)
-				out, err := executeRun(ctx, runID, datasetName, matrixPath, emb, modelID, cfg, hnsw, runOptions{
-					K: k, Hops: hops, Oversample: oversample, Seed: seed,
+				out, err := executeRun(ctx, runID, datasetName, matrixPath, emb, modelID, cfg, conn, runOptions{
+					K: k, Hops: hops, Oversample: oversample,
 				})
 				if err != nil {
 					return fmt.Errorf("entry %s: %w", entry.Name, err)
@@ -95,7 +94,6 @@ func newSweepCmd() *cobra.Command {
 	cmd.Flags().IntVar(&k, "k", 8, "queries returned per Recall")
 	cmd.Flags().IntVar(&hops, "hops", 1, "graph expansion hops")
 	cmd.Flags().IntVar(&oversample, "oversample", 0, "vector-search oversample")
-	cmd.Flags().Uint64Var(&seed, "hnsw-seed", 42, "HNSW RNG seed")
 	return cmd
 }
 
@@ -122,4 +120,3 @@ func sanitize(s string) string {
 	}
 	return string(out)
 }
-

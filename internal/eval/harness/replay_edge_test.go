@@ -35,14 +35,15 @@ func TestReplay_EmptyCorpus(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
+	conn, prefix := neo4jConnAndPrefix(t)
 	res, err := harness.Replay(ctx, harness.ReplayOptions{
 		CorpusStorePath: filepath.Join(root, "corpus.sqlite"),
 		EmbedCachePath:  filepath.Join(root, "embedcache.sqlite"),
-		MemmyDBPath:     filepath.Join(root, "memmy.db"),
 		Embedder:        emb,
 		EmbedderModelID: modelID,
-		HNSWRandSeed:    42,
 		DatasetName:     "alpha",
+		Neo4j:           conn,
+		TenantTuple:     map[string]string{"agent": prefix},
 	})
 	if err != nil {
 		t.Fatalf("Replay (empty corpus): %v", err)
@@ -86,14 +87,15 @@ func TestReplay_CacheReuseAcrossInvocations(t *testing.T) {
 	}
 
 	wrapped := &replayCounter{Embedder: base}
+	conn, prefix := neo4jConnAndPrefix(t)
 	res, err := harness.Replay(ctx, harness.ReplayOptions{
 		CorpusStorePath: filepath.Join(root, "corpus.sqlite"),
 		EmbedCachePath:  filepath.Join(root, "embedcache.sqlite"),
-		MemmyDBPath:     filepath.Join(root, "memmy.db"),
 		Embedder:        wrapped,
 		EmbedderModelID: modelID,
-		HNSWRandSeed:    42,
 		DatasetName:     "alpha",
+		Neo4j:           conn,
+		TenantTuple:     map[string]string{"agent": prefix},
 	})
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
@@ -124,15 +126,15 @@ func TestReplay_CustomTenantTuple(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
-	custom := map[string]string{"user": "ada", "scope": "test"}
+	conn, prefix := neo4jConnAndPrefix(t)
+	custom := map[string]string{"user": prefix, "scope": "test"}
 	res, err := harness.Replay(ctx, harness.ReplayOptions{
 		CorpusStorePath: filepath.Join(root, "corpus.sqlite"),
 		EmbedCachePath:  filepath.Join(root, "embedcache.sqlite"),
-		MemmyDBPath:     filepath.Join(root, "memmy.db"),
 		Embedder:        emb,
 		EmbedderModelID: modelID,
-		HNSWRandSeed:    42,
 		DatasetName:     "alpha",
+		Neo4j:           conn,
 		TenantTuple:     custom,
 	})
 	if err != nil {

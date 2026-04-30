@@ -41,20 +41,18 @@ type DatasetManifest struct {
 
 // RunManifest documents one `run` invocation's parameters and provenance.
 type RunManifest struct {
-	SchemaVersion       int               `json:"schema_version"`
-	RunID               string            `json:"run_id"`
-	DatasetName         string            `json:"dataset_name"`
-	StartedAt           time.Time         `json:"started_at"`
-	FinishedAt          time.Time         `json:"finished_at"`
-	MemmyGitSHA         string            `json:"memmy_git_sha"`
-	ConfigPath          string            `json:"config_path,omitempty"`
-	ServiceConfigJSON   json.RawMessage   `json:"service_config_json,omitempty"`
-	HNSWConfigJSON      json.RawMessage   `json:"hnsw_config_json,omitempty"`
-	FlatScanThreshold   int               `json:"flat_scan_threshold,omitempty"`
-	HNSWRandSeed        uint64            `json:"hnsw_rand_seed,omitempty"`
-	QueriesExecuted     int               `json:"queries_executed"`
-	CorpusSnapshotHash  string            `json:"corpus_snapshot_hash,omitempty"`
-	Extra               map[string]string `json:"extra,omitempty"`
+	SchemaVersion      int               `json:"schema_version"`
+	RunID              string            `json:"run_id"`
+	DatasetName        string            `json:"dataset_name"`
+	StartedAt          time.Time         `json:"started_at"`
+	FinishedAt         time.Time         `json:"finished_at"`
+	MemmyGitSHA        string            `json:"memmy_git_sha"`
+	ConfigPath         string            `json:"config_path,omitempty"`
+	ServiceConfigJSON  json.RawMessage   `json:"service_config_json,omitempty"`
+	FlatScanThreshold  int               `json:"flat_scan_threshold,omitempty"`
+	QueriesExecuted    int               `json:"queries_executed"`
+	CorpusSnapshotHash string            `json:"corpus_snapshot_hash,omitempty"`
+	Extra              map[string]string `json:"extra,omitempty"`
 }
 
 // WriteDataset writes a DatasetManifest to path atomically.

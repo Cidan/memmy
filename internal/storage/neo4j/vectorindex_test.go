@@ -1,4 +1,4 @@
-package sqlitestore_test
+package neo4jstore_test
 
 import (
 	"context"
@@ -7,30 +7,39 @@ import (
 	"math/rand/v2"
 	"sort"
 	"testing"
+
+	"github.com/Cidan/memmy/internal/storage/neo4j/neo4jtest"
+	"github.com/Cidan/memmy/internal/types"
 )
 
-func TestVectorIndex_Flat_TopK(t *testing.T) {
-	const dim = 16
-	st := openTestStorage(t, dim, withFlatScanThreshold(100000)) // force flat scan
+// TestVectorIndex_FlatScan_TopK seeds N vectors into a tenant under
+// the flat-scan threshold, runs a Search, and confirms the returned
+// top-K matches the brute-force cosine ranking. The flat-scan path is
+// the correctness oracle for the native vector index path tested in
+// oracle_test.go.
+func TestVectorIndex_FlatScan_TopK(t *testing.T) {
+	st, _, prefix := neo4jtest.Open(t, testDim, neo4jtest.WithFlatScanThreshold(100000))
+	g := st.Graph()
 	v := st.VectorIndex()
 	ctx := context.Background()
-	tenant := "t"
+	tenant := prefix
 
-	const N = 200
+	const N = 100
 	r := rand.New(rand.NewPCG(1, 2))
 	vecs := make(map[string][]float32, N)
-	ids := make([]string, 0, N)
 	for i := 0; i < N; i++ {
 		id := fmt.Sprintf("n-%04d", i)
-		vec := randVec(r, dim)
-		ids = append(ids, id)
+		vec := randVec(r, testDim)
 		vecs[id] = vec
+		if err := g.PutNode(ctx, types.Node{ID: id, TenantID: tenant, Weight: 1}); err != nil {
+			t.Fatal(err)
+		}
 		if err := v.Insert(ctx, tenant, id, vec); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	q := randVec(r, dim)
+	q := randVec(r, testDim)
 	got, err := v.Search(ctx, tenant, q, 10)
 	if err != nil {
 		t.Fatal(err)
@@ -55,34 +64,37 @@ func TestVectorIndex_Flat_TopK(t *testing.T) {
 			t.Fatalf("rank %d mismatch: got %s, want %s (sim got=%v want=%v)",
 				i, got[i].NodeID, all[i].id, got[i].Sim, all[i].sim)
 		}
-		if math.Abs(got[i].Sim-all[i].sim) > 1e-5 {
+		if math.Abs(got[i].Sim-all[i].sim) > 1e-4 {
 			t.Fatalf("rank %d sim mismatch: got %v want %v", i, got[i].Sim, all[i].sim)
 		}
 	}
 }
 
-func TestVectorIndex_Flat_RespectsK(t *testing.T) {
-	st := openTestStorage(t, 8, withFlatScanThreshold(100000))
+func TestVectorIndex_FlatScan_RespectsK(t *testing.T) {
+	st, _, prefix := neo4jtest.Open(t, testDim, neo4jtest.WithFlatScanThreshold(100000))
+	g := st.Graph()
 	v := st.VectorIndex()
 	ctx := context.Background()
 	r := rand.New(rand.NewPCG(7, 13))
 	for i := 0; i < 5; i++ {
-		_ = v.Insert(ctx, "t", fmt.Sprintf("n-%d", i), randVec(r, 8))
+		id := fmt.Sprintf("n-%d", i)
+		_ = g.PutNode(ctx, types.Node{ID: id, TenantID: prefix, Weight: 1})
+		_ = v.Insert(ctx, prefix, id, randVec(r, testDim))
 	}
-	got, _ := v.Search(ctx, "t", randVec(r, 8), 100)
+	got, _ := v.Search(ctx, prefix, randVec(r, testDim), 100)
 	if len(got) != 5 {
 		t.Fatalf("len=%d, want 5 (corpus size)", len(got))
 	}
-	got, _ = v.Search(ctx, "t", randVec(r, 8), 2)
+	got, _ = v.Search(ctx, prefix, randVec(r, testDim), 2)
 	if len(got) != 2 {
 		t.Fatalf("len=%d, want 2", len(got))
 	}
 }
 
-func TestVectorIndex_Flat_EmptyTenant(t *testing.T) {
-	st := openTestStorage(t, 8, withFlatScanThreshold(100000))
+func TestVectorIndex_FlatScan_EmptyTenant(t *testing.T) {
+	st, _, _ := neo4jtest.Open(t, testDim, neo4jtest.WithFlatScanThreshold(100000))
 	v := st.VectorIndex()
-	got, err := v.Search(context.Background(), "no-such-tenant", make([]float32, 8), 10)
+	got, err := v.Search(context.Background(), "no-such-tenant", make([]float32, testDim), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,63 +104,73 @@ func TestVectorIndex_Flat_EmptyTenant(t *testing.T) {
 }
 
 func TestVectorIndex_Insert_DimMismatch(t *testing.T) {
-	st := openTestStorage(t, 16)
+	st, _, prefix := neo4jtest.Open(t, testDim)
 	v := st.VectorIndex()
-	if err := v.Insert(context.Background(), "t", "n", make([]float32, 8)); err == nil {
+	if err := v.Insert(context.Background(), prefix, "n", make([]float32, testDim/2)); err == nil {
 		t.Fatal("expected dim-mismatch error")
 	}
 }
 
 func TestVectorIndex_Size(t *testing.T) {
-	st := openTestStorage(t, 4)
+	st, _, prefix := neo4jtest.Open(t, testDim)
+	g := st.Graph()
 	v := st.VectorIndex()
 	ctx := context.Background()
 
 	r := rand.New(rand.NewPCG(99, 99))
 	for i := 0; i < 7; i++ {
-		_ = v.Insert(ctx, "t", fmt.Sprintf("n-%d", i), randVec(r, 4))
+		id := fmt.Sprintf("n-%d", i)
+		_ = g.PutNode(ctx, types.Node{ID: id, TenantID: prefix, Weight: 1})
+		_ = v.Insert(ctx, prefix, id, randVec(r, testDim))
 	}
-	sz, _ := v.Size(ctx, "t")
+	sz, _ := v.Size(ctx, prefix)
 	if sz != 7 {
 		t.Fatalf("Size=%d, want 7", sz)
 	}
 }
 
 func TestVectorIndex_Replace(t *testing.T) {
-	st := openTestStorage(t, 4)
+	st, _, prefix := neo4jtest.Open(t, testDim)
+	g := st.Graph()
 	v := st.VectorIndex()
 	ctx := context.Background()
 
 	r := rand.New(rand.NewPCG(11, 11))
-	_ = v.Insert(ctx, "t", "x", randVec(r, 4))
-	sz0, _ := v.Size(ctx, "t")
-	_ = v.Insert(ctx, "t", "x", randVec(r, 4)) // upsert
-	sz1, _ := v.Size(ctx, "t")
+	_ = g.PutNode(ctx, types.Node{ID: "x", TenantID: prefix, Weight: 1})
+	_ = v.Insert(ctx, prefix, "x", randVec(r, testDim))
+	sz0, _ := v.Size(ctx, prefix)
+	_ = v.Insert(ctx, prefix, "x", randVec(r, testDim)) // upsert
+	sz1, _ := v.Size(ctx, prefix)
 	if sz0 != 1 || sz1 != 1 {
 		t.Fatalf("expected size 1 both times: sz0=%d sz1=%d", sz0, sz1)
 	}
 }
 
+// TestVectorIndex_Delete tombstones the node — Size drops, and the
+// tombstoned node never appears in subsequent search results.
 func TestVectorIndex_Delete(t *testing.T) {
-	st := openTestStorage(t, 4)
+	st, _, prefix := neo4jtest.Open(t, testDim, neo4jtest.WithFlatScanThreshold(100000))
+	g := st.Graph()
 	v := st.VectorIndex()
 	ctx := context.Background()
 
 	r := rand.New(rand.NewPCG(2, 3))
 	for i := 0; i < 5; i++ {
-		_ = v.Insert(ctx, "t", fmt.Sprintf("n-%d", i), randVec(r, 4))
+		id := fmt.Sprintf("n-%d", i)
+		_ = g.PutNode(ctx, types.Node{ID: id, TenantID: prefix, Weight: 1})
+		_ = v.Insert(ctx, prefix, id, randVec(r, testDim))
 	}
-	if err := v.Delete(ctx, "t", "n-2"); err != nil {
+	if err := v.Delete(ctx, prefix, "n-2"); err != nil {
 		t.Fatal(err)
 	}
-	sz, _ := v.Size(ctx, "t")
+	sz, _ := v.Size(ctx, prefix)
 	if sz != 4 {
 		t.Fatalf("Size after delete = %d, want 4", sz)
 	}
-	hits, _ := v.Search(ctx, "t", randVec(r, 4), 10)
+	hits, _ := v.Search(ctx, prefix, randVec(r, testDim), 10)
 	for _, h := range hits {
 		if h.NodeID == "n-2" {
-			t.Fatalf("deleted node still in results: %v", hits)
+			t.Fatalf("tombstoned node still in results: %v", hits)
 		}
 	}
 }

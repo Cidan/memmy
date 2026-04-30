@@ -19,9 +19,12 @@ server:
       enabled: true
       addr: "127.0.0.1:9999"
 storage:
-  backend: sqlite
-  sqlite:
-    path: "/tmp/memmy.db"
+  backend: neo4j
+  neo4j:
+    uri: bolt://localhost:7687
+    user: neo4j
+    password: secret
+    database: neo4j
 embedder:
   backend: fake
   fake:
@@ -41,15 +44,47 @@ memory:
 	if cfg.Server.Transports["mcp"].Addr != "127.0.0.1:9999" {
 		t.Fatalf("addr=%q", cfg.Server.Transports["mcp"].Addr)
 	}
-	if cfg.Storage.SQLite.Path != "/tmp/memmy.db" {
-		t.Fatalf("path=%q", cfg.Storage.SQLite.Path)
+	if cfg.Storage.Neo4j.URI != "bolt://localhost:7687" {
+		t.Fatalf("uri=%q", cfg.Storage.Neo4j.URI)
+	}
+	if cfg.Storage.Neo4j.Password != "secret" {
+		t.Fatalf("password=%q", cfg.Storage.Neo4j.Password)
 	}
 	if cfg.Embedder.Backend != "fake" || cfg.EmbedderDim() != 32 {
 		t.Fatalf("embedder %+v", cfg.Embedder)
 	}
-	// Defaults preserved where not overridden.
-	if cfg.VectorIndex.HNSW.M != 16 {
-		t.Fatalf("HNSW.M=%d, want 16 (default)", cfg.VectorIndex.HNSW.M)
+}
+
+func TestConfig_PasswordEnvExpansion(t *testing.T) {
+	t.Setenv("TEST_NEO4J_PW", "shh-it-is-a-secret")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memmy.yaml")
+	contents := `
+server:
+  transports:
+    mcp:
+      enabled: true
+      addr: "127.0.0.1:9999"
+storage:
+  backend: neo4j
+  neo4j:
+    uri: bolt://localhost:7687
+    user: neo4j
+    password: ${TEST_NEO4J_PW}
+embedder:
+  backend: fake
+  fake:
+    dim: 32
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Storage.Neo4j.Password != "shh-it-is-a-secret" {
+		t.Errorf("env not expanded: %q", cfg.Storage.Neo4j.Password)
 	}
 }
 
@@ -83,6 +118,7 @@ func TestConfig_RejectsZeroDim(t *testing.T) {
 
 func stdioOnlyConfig() config.Config {
 	cfg := config.Default()
+	cfg.Storage.Neo4j.Password = "test-password" // Default() leaves this empty
 	cfg.Server.Transports = map[string]config.TransportConfig{
 		config.TransportStdio: {Enabled: true}, // no Addr
 	}
@@ -144,6 +180,7 @@ func TestConfig_StdioPlusDisabledOther_Accepted(t *testing.T) {
 
 func TestConfig_StdioRequiresNoAddr(t *testing.T) {
 	cfg := config.Default()
+	cfg.Storage.Neo4j.Password = "test-password"
 	cfg.Server.Transports = map[string]config.TransportConfig{
 		config.TransportStdio: {Enabled: true, Addr: ""},
 	}
@@ -159,9 +196,10 @@ func TestTenantSchemaConfig_EmptyAccepted(t *testing.T) {
 	if cfg.Tenant.IsConfigured() {
 		t.Fatal("default config should have an unconfigured tenant schema")
 	}
-	// Default() ships with NO transports enabled — the operator must
-	// declare one explicitly. Add a stdio transport here so the rest
-	// of Validate() can run.
+	// Default() ships with NO transports enabled and NO Neo4j password
+	// — the operator must declare both explicitly. Set both here so
+	// the rest of Validate() can run.
+	cfg.Storage.Neo4j.Password = "test-password"
 	cfg.Server.Transports = map[string]config.TransportConfig{
 		config.TransportStdio: {Enabled: true},
 	}
@@ -179,9 +217,11 @@ server:
     stdio:
       enabled: true
 storage:
-  backend: sqlite
-  sqlite:
-    path: "/tmp/memmy.db"
+  backend: neo4j
+  neo4j:
+    uri: bolt://localhost:7687
+    user: neo4j
+    password: secret
 embedder:
   backend: fake
   fake:
@@ -280,9 +320,11 @@ func TestConfig_LoadOmittedServerSectionFails(t *testing.T) {
 	path := filepath.Join(dir, "memmy.yaml")
 	contents := `
 storage:
-  backend: sqlite
-  sqlite:
-    path: "/tmp/memmy.db"
+  backend: neo4j
+  neo4j:
+    uri: bolt://localhost:7687
+    user: neo4j
+    password: secret
 embedder:
   backend: fake
   fake:

@@ -30,11 +30,11 @@ type Matrix struct {
 	Entries []Entry `yaml:"matrix"`
 }
 
-// Entry is one configuration to sweep over.
+// Entry is one configuration to sweep over. Overrides are applied
+// over the loaded ServiceConfig via sweep.ApplyServiceOverrides.
 type Entry struct {
-	Name      string                 `yaml:"name"`
-	Overrides map[string]any         `yaml:"overrides"`
-	HNSW      map[string]any         `yaml:"hnsw"`
+	Name      string         `yaml:"name"`
+	Overrides map[string]any `yaml:"overrides"`
 }
 
 // Load reads a sweep YAML.

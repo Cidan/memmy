@@ -1,8 +1,8 @@
 # memmy
 
-memmy is an LLM memory system written in Go (toolchain Go 1.26.2). It exposes Hebbian-reinforced, decay-aware memory to one or more agents over MCP (with gRPC and HTTP transport adapters reserved for future work). The reference storage backend is SQLite (WAL mode), which lets multiple host processes — daemons, ad-hoc tools, in-process libraries — share one corpus on disk; the same logical model maps to Postgres, MariaDB, Bigtable, Spanner, and other stores that satisfy the `Graph` and `VectorIndex` interfaces. The SQLite driver (`github.com/mattn/go-sqlite3`) is the project's only CGO dependency.
+memmy is an LLM memory system written in Go (toolchain Go 1.26.2). It exposes Hebbian-reinforced, decay-aware memory to one or more agents over MCP (with gRPC and HTTP transport adapters reserved for future work). The reference storage backend is **Neo4j** via the Bolt protocol — both the Hebbian memory graph and the HNSW navigation graph (Neo4j's native vector index) live in one database, and many memmy processes can share one Neo4j instance natively. The Bolt driver (`github.com/neo4j/neo4j-go-driver/v5`) is pure-Go; memmy has no CGO dependencies.
 
-The load-bearing design principle is **one source of truth: the database**. Vectors, the HNSW navigation graph, nodes, messages, and Hebbian memory edges all live in the configured storage backend — there is no in-memory index, no secondary search engine, no parallel cache. memmy itself is **stateless across requests**: only connection pools, configuration, and process-local rate limiters are kept in-memory. This is what lets N memmy instances scale out behind a multi-writer backend without coordination.
+The load-bearing design principle is **one source of truth: the database**. Vectors, the HNSW navigation graph, nodes, messages, and Hebbian memory edges all live in Neo4j — there is no in-memory index, no secondary search engine, no parallel cache. memmy itself is **stateless across requests**: only connection pools, configuration, and process-local rate limiters are kept in-memory. This is what lets N memmy instances scale out behind a multi-writer Neo4j without coordination.
 
 ## Documents
 
@@ -10,15 +10,28 @@ The load-bearing design principle is **one source of truth: the database**. Vect
 - [CLAUDE.md](CLAUDE.md) — coding conventions and architectural rules to follow when changing the codebase.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — the running implementation checklist.
 
-## Build & run
+## Setup
+
+memmy needs a running Neo4j instance reachable over Bolt. Quick options:
+
+- Docker: `docker run -p 7687:7687 -e NEO4J_AUTH=neo4j/<your-password> neo4j:2026.04`
+- macOS: `brew install neo4j && brew services start neo4j`
+- Linux/desktop: download Neo4j Desktop or install the community tarball.
+
+Default connection: `bolt://localhost:7687`, user `neo4j`. Neo4j requires the password to be at least 8 characters; tests and the example config read it from `$NEO4J_PASSWORD`.
+
+## Build & migrate & run
 
 ```sh
 go build ./cmd/memmy
-cp memmy.example.yaml memmy.yaml   # then edit
-./memmy --config memmy.yaml
+cp memmy.example.yaml memmy.yaml   # then edit; password reads ${NEO4J_PASSWORD} by default
+NEO4J_PASSWORD=<yours> ./memmy migrate --config memmy.yaml   # apply schema, idempotent
+NEO4J_PASSWORD=<yours> ./memmy serve   --config memmy.yaml   # run the server
 ```
 
-No transport is enabled by default — `server.transports` must explicitly declare which transport(s) to run, or the config fails validation. `memmy.example.yaml` ships with the streamable MCP HTTP transport enabled on port 8765 and the stdio transport disabled. Switch `embedder.backend` to `gemini` and provide `GEMINI_API_KEY` for production use.
+`memmy serve` is the default subcommand, so `./memmy --config memmy.yaml` is equivalent to `./memmy serve --config memmy.yaml`. The server refuses to start if the database's schema version doesn't match the binary; the fix is always `memmy migrate`.
+
+No transport is enabled by default — `server.transports` must explicitly declare which transport(s) to run, or the config fails validation. `memmy.example.yaml` ships with the streamable MCP HTTP transport enabled on port 8765 and the stdio transport disabled. Switch `embedder.backend` to `gemini` and provide `embedder.gemini.api_key` for production use.
 
 memmy also supports the **MCP stdio transport** for use as a child process under an MCP-aware host (editor or agent runtime). Set `server.transports.stdio.enabled: true` and disable every other transport — stdio is mutually exclusive with HTTP listeners because it owns the process's stdin/stdout. Logs always go to stderr.
 
@@ -31,6 +44,7 @@ memmy ships a small facade at the module root for in-process embedding. The daem
 ```go
 import (
     "context"
+    "os"
 
     "github.com/Cidan/memmy"
 )
@@ -53,8 +67,21 @@ func main() {
     })
     if err != nil { /* ... */ }
 
-    svc, closer, err := memmy.Open(memmy.Options{
-        DBPath:       "/var/lib/myapp/memmy.db",
+    neo4j := memmy.Neo4jOptions{
+        URI:      "bolt://localhost:7687",
+        User:     "neo4j",
+        Password: os.Getenv("NEO4J_PASSWORD"),
+        Database: "neo4j",
+    }
+
+    // Migrate once at deployment time, before Open. Idempotent.
+    if err := memmy.Migrate(ctx, memmy.MigrationOptions{
+        Neo4j: neo4j,
+        Dim:   emb.Dim(),
+    }); err != nil { /* ... */ }
+
+    svc, closer, err := memmy.Open(ctx, memmy.Options{
+        Neo4j:        neo4j,
         Embedder:     emb,
         TenantSchema: schema,
     })
@@ -79,11 +106,12 @@ Notes:
 
 - **`Embedder` is required and pluggable.** Use `memmy.NewFakeEmbedder(dim)` for tests or supply any type satisfying the `memmy.Embedder` interface.
 - **`TenantSchema` is optional.** Pass `nil` (or call `NewTenantSchema` with an empty `TenantSchemaConfig`) to accept any tuple shape.
-- **`closer.Close()` releases the SQLite handles.** Both the writer and reader DB are closed; the WAL file is checkpointed by SQLite on the last connection close. The embedder's lifecycle is the caller's; `Close` does not touch it.
+- **`closer.Close()` releases the Neo4j driver pool.** The embedder's lifecycle is the caller's; `Close` does not touch it.
+- **Open enforces schema version.** If the database is older than what this binary expects, `Open` returns an error directing you to `memmy.Migrate(ctx, ...)`. Tests can pass `Options.SkipMigrationCheck: true` when they manage migrations themselves.
 - **No transports start.** The facade is library-only — to expose `MemoryService` over MCP / HTTP, run `cmd/memmy` with a YAML config instead.
-- **Tunable overrides use a pointer.** `Options.ServiceConfig` and `Options.HNSW` are `*ServiceConfig` and `*HNSWConfig` respectively — `nil` means "use defaults," and any non-nil value is treated as a complete config. To change one knob, start from `memmy.DefaultServiceConfig()` (or `memmy.DefaultHNSWConfig()`), mutate, and pass the address. The facade does not field-merge because some service tunables (`RefractoryPeriod`, `LogDampening`) accept zero as an intentional disable signal.
+- **Tunable overrides use a pointer.** `Options.ServiceConfig` is `*ServiceConfig` — `nil` means "use defaults," and any non-nil value is treated as a complete config. To change one knob, start from `memmy.DefaultServiceConfig()`, mutate, and pass the address. The facade does not field-merge because some service tunables (`RefractoryPeriod`, `LogDampening`) accept zero as an intentional disable signal.
 
-The full surface (request/result types, `EdgeKind`, `EmbedTask`, tunable `ServiceConfig`, HNSW config) is re-exported as type aliases on the `memmy` package; package internals stay under `internal/`.
+The full surface (request/result types, `EdgeKind`, `EmbedTask`, tunable `ServiceConfig`) is re-exported as type aliases on the `memmy` package; package internals stay under `internal/`.
 
 ## MCP tool surface
 
@@ -103,11 +131,11 @@ Reinforce/Demote/Mark go through a per-node refractory window (default 60 s) so 
 
 ## Tests
 
+Storage and service tests connect to a real Neo4j; tenant isolation is per-test (each test gets a unique tenant prefix and a `t.Cleanup` that DETACH DELETEs everything written under it). Tests skip cleanly when `NEO4J_PASSWORD` is not set, so `go test ./...` succeeds on hosts without a Neo4j.
+
 ```sh
-go test ./...
-go test -race ./...
+NEO4J_PASSWORD=<yours> go test ./...
+NEO4J_PASSWORD=<yours> go test -race ./...
 ```
 
-Storage tests run against a real SQLite database in `t.TempDir()` — there are no storage mocks. The HNSW implementation is verified against a flat-scan oracle (recall@k floor enforced in tests). A multi-handle visibility test (`TestMultiHandle_ConcurrentReadWrite`) opens two `*Storage` handles against the same DB file simultaneously and asserts cross-handle commit visibility — proving the WAL coordination property that lets multiple library-embedded processes share one corpus.
-
-Building requires a working C toolchain because `github.com/mattn/go-sqlite3` is CGO. `CGO_ENABLED=1` (the default on Linux/macOS) is sufficient.
+The `cmd/memmy` server is pure-Go and builds with `CGO_ENABLED=0`. The optional `cmd/memmy-eval` validation harness still depends on `mattn/go-sqlite3` for its local data stores (`corpus.sqlite`, `embedcache.sqlite`, `queries.sqlite`); that's a tooling-only dependency unrelated to memmy's runtime storage.

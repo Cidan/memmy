@@ -113,8 +113,12 @@ func (v vectorIndexAdapter) Close() error { return nil }
 
 // flatScan computes cosine similarity over every non-tombstoned node
 // in the tenant. With L2-normalized vectors at write+query time, the
-// flat-scan score equals the dot product. Used as the oracle for the
-// native index recall test.
+// flat-scan score equals the dot product (range [-1, 1]).
+//
+// Neo4j's `vector.similarity.cosine` returns the score in [0, 1] (it
+// applies the standard `(1 + cos)/2` mapping). memmy's VectorIndex
+// contract is the standard cosine in [-1, 1], so we invert the
+// mapping before returning. Same logic applies to nativeIndexSearch.
 func (v vectorIndexAdapter) flatScan(ctx context.Context, tenant string, qVec []any, n int) ([]vport.Hit, error) {
 	res, err := v.s.withReadSession(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		r, err := tx.Run(ctx, `
@@ -133,7 +137,7 @@ func (v vectorIndexAdapter) flatScan(ctx context.Context, tenant string, qVec []
 			rec := r.Record()
 			idRaw, _ := rec.Get("id")
 			simRaw, _ := rec.Get("sim")
-			out = append(out, vport.Hit{NodeID: asString(idRaw), Sim: asFloat(simRaw)})
+			out = append(out, vport.Hit{NodeID: asString(idRaw), Sim: neo4jCosToStd(asFloat(simRaw))})
 		}
 		return out, r.Err()
 	})
@@ -145,6 +149,10 @@ func (v vectorIndexAdapter) flatScan(ctx context.Context, tenant string, qVec []
 	}
 	return res.([]vport.Hit), nil
 }
+
+// neo4jCosToStd converts Neo4j's [0, 1] cosine score to the standard
+// [-1, 1] cosine value the VectorIndex contract uses.
+func neo4jCosToStd(s float64) float64 { return 2*s - 1 }
 
 // nativeIndexSearch consults the global vector index and filters the
 // results down to the requested tenant + non-tombstoned set. Index
@@ -178,7 +186,7 @@ func (v vectorIndexAdapter) nativeIndexSearch(ctx context.Context, tenant string
 			rec := r.Record()
 			idRaw, _ := rec.Get("id")
 			simRaw, _ := rec.Get("sim")
-			out = append(out, vport.Hit{NodeID: asString(idRaw), Sim: asFloat(simRaw)})
+			out = append(out, vport.Hit{NodeID: asString(idRaw), Sim: neo4jCosToStd(asFloat(simRaw))})
 		}
 		return out, r.Err()
 	})

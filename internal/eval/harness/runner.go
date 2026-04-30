@@ -39,14 +39,14 @@ type QueryResult struct {
 
 // RunQueriesOptions configures one query battery.
 type RunQueriesOptions struct {
-	Service       memmy.Service
-	Tenant        map[string]string
-	InspectPath   string // path to the SAME memmy db the service writes
-	K             int
-	Hops          int
-	OversampleN   int
-	AdvanceClock  time.Duration // FakeClock advance between queries (0 = none)
-	FakeClock     *memmy.FakeClock
+	Service      memmy.Service
+	Tenant       map[string]string
+	InspectConn  inspect.Connection // Neo4j connection for the inspect Reader
+	K            int
+	Hops         int
+	OversampleN  int
+	AdvanceClock time.Duration // FakeClock advance between queries (0 = none)
+	FakeClock    *memmy.FakeClock
 }
 
 // RunQueries executes each labeled query against the live service,
@@ -63,8 +63,8 @@ func RunQueries(ctx context.Context, qs []queries.LabeledQuery, opts RunQueriesO
 	if opts.Service == nil {
 		return nil, errors.New("harness: Service required")
 	}
-	if opts.InspectPath == "" {
-		return nil, errors.New("harness: InspectPath required")
+	if opts.InspectConn.URI == "" {
+		return nil, errors.New("harness: InspectConn.URI required")
 	}
 	if len(opts.Tenant) == 0 {
 		return nil, errors.New("harness: Tenant required")
@@ -73,7 +73,7 @@ func RunQueries(ctx context.Context, qs []queries.LabeledQuery, opts RunQueriesO
 		opts.K = 8
 	}
 
-	r, err := inspect.Open(opts.InspectPath)
+	r, err := inspect.Open(opts.InspectConn)
 	if err != nil {
 		return nil, err
 	}

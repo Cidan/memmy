@@ -10,6 +10,7 @@ import (
 	"github.com/Cidan/memmy/internal/embed"
 	"github.com/Cidan/memmy/internal/eval/corpus"
 	"github.com/Cidan/memmy/internal/eval/embedcache"
+	"github.com/Cidan/memmy/internal/eval/inspect"
 )
 
 // ReplayOptions configures one Replay call.
@@ -19,8 +20,6 @@ type ReplayOptions struct {
 	// EmbedCachePath: cache primed by Ingest. Replay's embedder consults
 	// this cache so re-running with the same corpus does not re-embed.
 	EmbedCachePath string
-	// MemmyDBPath: where to materialize the per-run memmy SQLite db.
-	MemmyDBPath string
 	// Embedder produces vectors via the cache wrapper.
 	Embedder embed.Embedder
 	// EmbedderModelID is the cache key namespace.
@@ -28,26 +27,26 @@ type ReplayOptions struct {
 	// ServiceConfig is the memmy service tunable bundle. Optional;
 	// nil means defaults.
 	ServiceConfig *memmy.ServiceConfig
-	// HNSW configures the per-tenant index. Optional; nil means defaults.
-	HNSW *memmy.HNSWConfig
 	// FlatScanThreshold below which Recall uses linear scan. 0 = default.
 	FlatScanThreshold int
-	// HNSWRandSeed seeds the HNSW layer-assignment RNG. 0 = time-derived.
-	HNSWRandSeed uint64
 	// TenantTuple identifies the synthetic tenant memmy will write under.
 	// Defaults to {agent: memmy-eval, dataset: <DatasetName>}.
 	TenantTuple map[string]string
 	// DatasetName is used as the default dataset key in TenantTuple.
 	DatasetName string
+	// Neo4j is the connection used for both the live memmy.Service and
+	// the inspect Reader. Required.
+	Neo4j inspect.Connection
 }
 
 // ReplayResult exposes the live service so a caller can run queries
-// without reopening. Close releases the underlying SQLite handle.
+// without reopening. Close releases the underlying Neo4j driver.
 type ReplayResult struct {
 	Service       memmy.Service
 	Closer        interface{ Close() error }
 	Tenant        map[string]string
 	FakeClock     *memmy.FakeClock
+	Neo4j         inspect.Connection
 	TurnsReplayed int
 	NodesWritten  int
 	StartedAt     time.Time
@@ -62,17 +61,16 @@ func (r *ReplayResult) Close() error {
 	return r.Closer.Close()
 }
 
-// OpenService opens a memmy service backed by opts.MemmyDBPath plus
-// an embedcache wrapper around opts.Embedder. Used both by Replay (to
-// build a fresh db from corpus) and by query-only paths that copied a
-// cached baseline db into place. clockSeed is what the FakeClock is
-// initialized to; pass the corpus's first-turn timestamp for fresh
-// replays or the corpus's last-turn timestamp for query-only opens
-// (so decay math sees a clock that's at-or-after every Node's
-// LastTouched).
-func OpenService(opts ReplayOptions, clockSeed time.Time) (*ReplayResult, error) {
-	if opts.MemmyDBPath == "" {
-		return nil, errors.New("harness: MemmyDBPath required")
+// OpenService opens a memmy service backed by the configured Neo4j
+// instance plus an embedcache wrapper around opts.Embedder. Used both
+// by Replay (to build a fresh state from corpus) and by query-only
+// paths. clockSeed is what the FakeClock is initialized to; pass the
+// corpus's first-turn timestamp for fresh replays or the corpus's
+// last-turn timestamp for query-only opens (so decay math sees a
+// clock that's at-or-after every Node's LastTouched).
+func OpenService(ctx context.Context, opts ReplayOptions, clockSeed time.Time) (*ReplayResult, error) {
+	if opts.Neo4j.URI == "" {
+		return nil, errors.New("harness: Neo4j.URI required")
 	}
 	if opts.Embedder == nil {
 		return nil, errors.New("harness: Embedder required")
@@ -99,14 +97,17 @@ func OpenService(opts ReplayOptions, clockSeed time.Time) (*ReplayResult, error)
 	}
 	cl := memmy.NewFakeClock(clockSeed)
 
-	svc, closer, err := memmy.Open(memmy.Options{
-		DBPath:            opts.MemmyDBPath,
+	svc, closer, err := memmy.Open(ctx, memmy.Options{
+		Neo4j: memmy.Neo4jOptions{
+			URI:      opts.Neo4j.URI,
+			User:     opts.Neo4j.User,
+			Password: opts.Neo4j.Password,
+			Database: opts.Neo4j.Database,
+		},
 		Embedder:          wrappedEmbedder,
 		Clock:             cl,
 		ServiceConfig:     opts.ServiceConfig,
-		HNSW:              opts.HNSW,
 		FlatScanThreshold: opts.FlatScanThreshold,
-		HNSWRandSeed:      opts.HNSWRandSeed,
 	})
 	if err != nil {
 		_ = cache.Close()
@@ -117,6 +118,7 @@ func OpenService(opts ReplayOptions, clockSeed time.Time) (*ReplayResult, error)
 		Closer:    multiCloser{closer, cache},
 		Tenant:    tenant,
 		FakeClock: cl,
+		Neo4j:     opts.Neo4j,
 		StartedAt: time.Now().UTC(),
 	}, nil
 }
@@ -145,7 +147,7 @@ func Replay(ctx context.Context, opts ReplayOptions) (*ReplayResult, error) {
 	if !clockSeed.IsZero() {
 		clockSeed = clockSeed.Add(-time.Second)
 	}
-	res, err := OpenService(opts, clockSeed)
+	res, err := OpenService(ctx, opts, clockSeed)
 	if err != nil {
 		return nil, err
 	}
@@ -252,4 +254,3 @@ func (m multiCloser) Close() error {
 	}
 	return first
 }
-

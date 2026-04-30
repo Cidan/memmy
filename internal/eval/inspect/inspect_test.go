@@ -2,21 +2,26 @@ package inspect_test
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/Cidan/memmy"
 	"github.com/Cidan/memmy/internal/eval/inspect"
+	"github.com/Cidan/memmy/internal/storage/neo4j/neo4jtest"
 )
 
 func TestInspect_RoundTripsThroughMemmyFacade(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "memmy.db")
-	svc, closer, err := memmy.Open(memmy.Options{
-		DBPath:       dbPath,
-		Embedder:     memmy.NewFakeEmbedder(32),
-		Clock:        memmy.NewFakeClock(time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)),
-		HNSWRandSeed: 42,
+	_, conn, prefix := neo4jtest.Open(t, 32)
+	svc, closer, err := memmy.Open(context.Background(), memmy.Options{
+		Neo4j: memmy.Neo4jOptions{
+			URI:      conn.URI,
+			User:     conn.User,
+			Password: conn.Password,
+			Database: conn.Database,
+		},
+		Embedder:           memmy.NewFakeEmbedder(32),
+		Clock:              memmy.NewFakeClock(time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)),
+		SkipMigrationCheck: true,
 	})
 	if err != nil {
 		t.Fatalf("memmy.Open: %v", err)
@@ -24,7 +29,7 @@ func TestInspect_RoundTripsThroughMemmyFacade(t *testing.T) {
 	t.Cleanup(func() { _ = closer.Close() })
 
 	ctx := context.Background()
-	tenant := map[string]string{"agent": "ada"}
+	tenant := map[string]string{"agent": prefix}
 	w, err := svc.Write(ctx, memmy.WriteRequest{
 		Tenant:  tenant,
 		Message: "Alpha. Beta. Gamma. Delta. Epsilon.",
@@ -36,7 +41,9 @@ func TestInspect_RoundTripsThroughMemmyFacade(t *testing.T) {
 		t.Fatal("no nodes produced")
 	}
 
-	r, err := inspect.Open(dbPath)
+	r, err := inspect.Open(inspect.Connection{
+		URI: conn.URI, User: conn.User, Password: conn.Password, Database: conn.Database,
+	})
 	if err != nil {
 		t.Fatalf("inspect.Open: %v", err)
 	}
@@ -46,14 +53,19 @@ func TestInspect_RoundTripsThroughMemmyFacade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTenants: %v", err)
 	}
-	if len(tenants) != 1 {
-		t.Fatalf("got %d tenants, want 1", len(tenants))
+	// Filter to just the tenant we created.
+	var ours *inspect.Tenant
+	for i := range tenants {
+		if tenants[i].Tuple["agent"] == prefix {
+			ours = &tenants[i]
+			break
+		}
 	}
-	if tenants[0].Tuple["agent"] != "ada" {
-		t.Errorf("tuple=%v", tenants[0].Tuple)
+	if ours == nil {
+		t.Fatalf("did not find our tenant in %d listed tenants", len(tenants))
 	}
 
-	tenantID := tenants[0].ID
+	tenantID := ours.ID
 	ids, err := r.ListNodes(ctx, tenantID)
 	if err != nil {
 		t.Fatalf("ListNodes: %v", err)
@@ -87,8 +99,8 @@ func TestInspect_RoundTripsThroughMemmyFacade(t *testing.T) {
 	}
 }
 
-func TestInspect_OpenRejectsEmptyPath(t *testing.T) {
-	if _, err := inspect.Open(""); err == nil {
-		t.Error("expected error for empty path")
+func TestInspect_OpenRejectsEmptyConnection(t *testing.T) {
+	if _, err := inspect.Open(inspect.Connection{}); err == nil {
+		t.Error("expected error for empty connection")
 	}
 }

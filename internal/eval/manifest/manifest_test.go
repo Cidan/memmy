@@ -57,7 +57,6 @@ func TestRunManifest_RoundTrip(t *testing.T) {
 		ConfigPath:         "configs/baseline.yaml",
 		ServiceConfigJSON:  cfgJSON,
 		FlatScanThreshold:  100000,
-		HNSWRandSeed:       42,
 		QueriesExecuted:    25,
 		CorpusSnapshotHash: "abc123",
 	}
